@@ -8,7 +8,7 @@ IntegrationLab synchronizes customer account records for **Meridian Capital**
 from a Salesforce-style CRM into Meridian's internal Customer Management
 System (CMS). Both external systems are simulated by separate mock services.
 
-## Current state (Milestone 7 complete)
+## Current state (Milestone 8 complete)
 
 ```
                      ┌──────────────────────────── IntegrationLab (FastAPI :8000) ───────────────────────────┐
@@ -377,17 +377,6 @@ partial `(lease_expires_at) WHERE status='processing'` (crash recovery),
 | Same-account events | per-account advisory lock (M4) serialises them | 30 events / 2 accounts / 4 processes → exactly 2 `created`, 28 `unchanged` |
 | Bounded execution | client timeouts + bounded retries. Lease ≥ worst-case + lock wait (startup check). Small batches. SIGTERM finishes the current event | tested |
 | Restarts | events are rows. Nothing is held in memory | new process drains events written before an engine/process restart. Live: API + DB container restart with workers stopped |
-
-### Designed for Milestone 7 (not implemented)
-
-A processing failure is currently a terminal `failed` with
-`last_error_retryable` recorded. M7 will:
-- turn retryable failures into `pending` with `available_at = now() + backoff(attempts)`;
-- add a `dead_letter` status after a bounded number of attempts;
-- add an authorized replay endpoint that moves `failed`/`dead_letter` back to `pending`.
-
-The claim query already honours `available_at`. No schema change is needed
-beyond widening the status CHECK.
 
 ## Retries, dead-letter and recovery (Milestone 7)
 

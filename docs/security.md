@@ -212,7 +212,8 @@ the old logic (verified).
 7. **Unencrypted DB connection** (local Docker network). Production needs
    `sslmode=verify-full`.
 8. **No rate limiting** on authentication failures or sync triggering.
-9. **No audit log** of administrative actions beyond `created_by` on mapping versions.
+9. ~~No audit log~~ Implemented in M7: replay, bulk replay, mapping publishes and
+   retention purges are audited (see "Audit and operational controls" and #17).
 10. **Mapping-publish authority.** Tenant admins can change how CRM data maps
     to CRM-owned fields, which is within their tenant and audited by
     `created_by`, but there's no approval workflow.
