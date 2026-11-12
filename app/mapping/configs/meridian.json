@@ -1,0 +1,31 @@
+{
+  "tenant_id": "meridian",
+  "version": 1,
+  "description": "Meridian Capital: Salesforce Account -> Customer Management System",
+  "fields": [
+    {"source": "Id", "target": "external_crm_id", "required": true, "transforms": ["strip"]},
+    {"source": "Name", "target": "legal_name", "required": true, "transforms": ["collapse_whitespace"]},
+    {"source": "OwnerName", "target": "relationship_manager", "required": true, "transforms": ["collapse_whitespace"]},
+    {
+      "source": "Industry",
+      "target": "industry_segment",
+      "transforms": [
+        "strip",
+        {
+          "name": "value_map",
+          "args": {
+            "values": {
+              "Financial Services": "FINANCIAL_SERVICES",
+              "Investment Management": "ASSET_MANAGEMENT",
+              "Banking": "BANKING",
+              "Insurance": "INSURANCE"
+            },
+            "default": "OTHER"
+          }
+        }
+      ]
+    },
+    {"source": "AnnualRevenue", "target": "annual_revenue_usd", "transforms": [{"name": "to_decimal", "args": {"places": 2}}]},
+    {"source": "LastModifiedDate", "target": "crm_last_modified_at", "transforms": ["iso_datetime"]}
+  ]
+}
