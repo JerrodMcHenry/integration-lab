@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from functools import lru_cache
 from typing import Annotated
 from uuid import UUID
 
@@ -12,35 +11,17 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import get_engine, get_tenant_repository
-from app.auth.dependencies import require, require_audited
+from app.api.dependencies import get_event_repository, get_webhook_ingestor, require
 from app.auth.permissions import Permission
 from app.auth.tokens import Principal
 from app.core.config import get_settings
-from app.repositories.sync_history import RepositoryError, RepositoryUnavailableError
+from app.db.errors import RepositoryError, RepositoryUnavailableError
 from app.repositories.audit import AuditEntry
 from app.repositories.webhook_events import PostgresWebhookEventRepository
-from app.services.secrets import EnvSecretResolver
 from app.webhooks.ingest import WebhookIngestor, WebhookRejected
 from app.webhooks.signing import SIGNATURE_HEADER
 
 router = APIRouter(tags=["webhooks"])
-
-
-@lru_cache
-def get_webhook_event_repository() -> PostgresWebhookEventRepository | None:
-    engine = get_engine()
-    return PostgresWebhookEventRepository(engine) if engine else None
-
-
-def get_webhook_ingestor() -> WebhookIngestor:
-    events = get_webhook_event_repository()
-    if events is None:
-        # Durable ingestion needs the database; never acknowledge without persistence.
-        raise HTTPException(status_code=503, detail="webhook ingestion requires a database")
-    settings = get_settings()
-    return WebhookIngestor(tenants=get_tenant_repository(), events=events,
-                           secrets=EnvSecretResolver(app_env=settings.environment), settings=settings.webhooks)
 
 
 async def _read_body(request: Request, limit: int) -> bytes:
@@ -146,13 +127,6 @@ class BulkReplayRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 
-def _events_repo() -> PostgresWebhookEventRepository:
-    repo = get_webhook_event_repository()
-    if repo is None:
-        raise HTTPException(status_code=503, detail="event store requires a database")
-    return repo
-
-
 def _to_view(e) -> WebhookEventView:
     err = EventError(code=e.last_error_code, message=e.last_error_message,
                      retryable=e.last_error_retryable) if e.last_error_code else None
@@ -167,7 +141,7 @@ def _to_view(e) -> WebhookEventView:
 @router.get("/webhooks/events", response_model=list[WebhookEventView],
             summary="Recent inbound events for the caller's tenant (requires history:read)")
 def list_events(principal: Annotated[Principal, Depends(require(Permission.HISTORY_READ))],
-                repo: Annotated[PostgresWebhookEventRepository, Depends(_events_repo)],
+                repo: Annotated[PostgresWebhookEventRepository, Depends(get_event_repository)],
                 limit: Annotated[int, Query(ge=1, le=500)] = 50,
                 status: Annotated[str | None, Query(pattern=r"^(pending|processing|succeeded|failed|dead_letter|ignored)$")] = None):
     return [_to_view(e) for e in repo.list_recent(principal.tenant_id, limit=limit, status=status)]
@@ -175,18 +149,17 @@ def list_events(principal: Annotated[Principal, Depends(require(Permission.HISTO
 
 @router.get("/webhooks/events/{event_uuid}", response_model=WebhookEventView)
 def get_event(event_uuid: UUID, principal: Annotated[Principal, Depends(require(Permission.HISTORY_READ))],
-              repo: Annotated[PostgresWebhookEventRepository, Depends(_events_repo)]):
+              repo: Annotated[PostgresWebhookEventRepository, Depends(get_event_repository)]):
     e = repo.get(principal.tenant_id, event_uuid)
     if e is None:
         raise HTTPException(status_code=404, detail="event not found")
     return _to_view(e)
 
 
-
 @router.get("/webhooks/events/{event_uuid}/attempts", response_model=list[AttemptResponse],
             summary="Processing attempts (retry history) of one event (requires history:read)")
 def event_attempts(event_uuid: UUID, principal: Annotated[Principal, Depends(require(Permission.HISTORY_READ))],
-                   repo: Annotated[PostgresWebhookEventRepository, Depends(_events_repo)]):
+                   repo: Annotated[PostgresWebhookEventRepository, Depends(get_event_repository)]):
     if repo.get(principal.tenant_id, event_uuid) is None:
         raise HTTPException(status_code=404, detail="event not found")
     return [AttemptResponse(**a.__dict__) for a in repo.attempts(principal.tenant_id, event_uuid)]
@@ -202,8 +175,8 @@ def event_attempts(event_uuid: UUID, principal: Annotated[Principal, Depends(req
                409: {"description": "Event is not in a replayable state (only failed / dead_letter)"}},
 )
 def replay_event(event_uuid: UUID,
-                 principal: Annotated[Principal, Depends(require_audited(Permission.SYNC_RUN, "webhook_event.replay"))],
-                 repo: Annotated[PostgresWebhookEventRepository, Depends(_events_repo)],
+                 principal: Annotated[Principal, Depends(require(Permission.SYNC_RUN, audit_action="webhook_event.replay"))],
+                 repo: Annotated[PostgresWebhookEventRepository, Depends(get_event_repository)],
                  body: Annotated[ReplayRequest | None, Body()] = None):
     audit = AuditEntry(actor=principal.subject, actor_client_id=principal.client_id, tenant_id=principal.tenant_id,
                        action="webhook_event.replay", outcome="success", target_type="webhook_event",
@@ -223,8 +196,8 @@ def replay_event(event_uuid: UUID,
 
 
 @router.post("/webhooks/events/replay", summary="Re-queue up to 100 failed/dead-lettered events (requires sync:run)")
-def replay_bulk(principal: Annotated[Principal, Depends(require_audited(Permission.SYNC_RUN, "webhook_event.replay_bulk"))],
-                repo: Annotated[PostgresWebhookEventRepository, Depends(_events_repo)],
+def replay_bulk(principal: Annotated[Principal, Depends(require(Permission.SYNC_RUN, audit_action="webhook_event.replay_bulk"))],
+                repo: Annotated[PostgresWebhookEventRepository, Depends(get_event_repository)],
                 body: BulkReplayRequest):
     bad = [st for st in body.statuses if st not in ("failed", "dead_letter")]
     if bad:

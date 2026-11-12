@@ -20,7 +20,6 @@ from typing import Any, Protocol
 
 from pydantic import TypeAdapter, ValidationError
 
-from app.integrations.crm_client import CRMClient
 from app.integrations.errors import IntegrationError
 from app.integrations.internal_client import InternalConflictError, InternalSystemClient
 from app.mapping.mapper import FieldMapper, MappingConfigError, MappingError
@@ -31,8 +30,8 @@ from app.schemas.internal_customer import (
     CustomerSyncPayload,
 )
 from app.schemas.sync import SyncErrorDetail, SyncRecord, SyncStage, SyncStatus
-from app.services.locks import InProcessSyncLocks, LockError, LockHandle, LockLostError, SyncLockProvider
-from app.services.tenant_context import ConnectionProvider, StaticConnections, TenantConnectionError
+from app.services.locks import LockError, LockHandle, LockLostError, SyncLockProvider
+from app.services.tenant_context import ConnectionProvider, TenantConnectionError
 
 
 class MappingProvider(Protocol):
@@ -78,21 +77,15 @@ class AccountSyncService:
     def __init__(
         self,
         *,
-        crm: CRMClient | None = None,
-        destination: InternalSystemClient | None = None,
+        connections: ConnectionProvider,
         mappings: MappingProvider,
         history: SyncHistoryRepository,
-        locks: SyncLockProvider | None = None,
-        connections: ConnectionProvider | None = None,
+        locks: SyncLockProvider,
     ) -> None:
-        if connections is None:
-            if crm is None or destination is None:
-                raise ValueError("provide either connections or both crm and destination")
-            connections = StaticConnections(crm, destination)
         self._connections = connections
         self._mappings = mappings
         self._history = history
-        self._locks: SyncLockProvider = locks or InProcessSyncLocks()
+        self._locks = locks
 
     # ------------------------------------------------------------------ #
     def sync_account(self, tenant_id: str, crm_account_id: str,

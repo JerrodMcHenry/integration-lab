@@ -13,7 +13,7 @@ See [security.md](security.md) for the token requirements and the permission mod
 | 401 | missing, malformed, expired or invalid token | `{"detail": "<reason>"}` + `WWW-Authenticate: Bearer error="invalid_token", …` |
 | 403 | missing permission | `{"detail": "missing permission sync:run"}` + `WWW-Authenticate: Bearer error="insufficient_scope", scope="…"` |
 | 403 | tenant not provisioned or suspended | `{"detail": "tenant is not provisioned" \| "tenant is suspended"}` |
-| 503 | IdP keys unavailable / database unavailable | `{"detail": "identity provider unavailable" \| "… storage unavailable"}` |
+| 503 | IdP keys unavailable / database unavailable | `{"detail": "identity provider unavailable" \| "database unavailable; retry later"}` |
 
 ## Synchronization
 
@@ -147,8 +147,3 @@ One audit record per event.
 |---|---|
 | `GET /health` | liveness `{"status": "healthy", …}` |
 | `GET /health/ready` | 200 `{"status":"ready","database":"ok"}` or 503 |
-
-## Legacy
-
-`POST /accounts` (M1 intake, validates and echoes, stores nothing) now
-requires `sync:run`.

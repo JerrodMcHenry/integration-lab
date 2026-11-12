@@ -19,7 +19,7 @@ from app.auth.tokens import (
     http_jwks_fetcher,
 )
 from mock_idp import main as mock_idp
-from tests.auth_helpers import AUDIENCE, ISSUER, TestIdP, new_rsa_key
+from tests.support.identity import AUDIENCE, ISSUER, TestIdP, new_rsa_key
 
 
 @pytest.fixture

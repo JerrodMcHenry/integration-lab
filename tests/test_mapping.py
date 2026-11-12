@@ -9,8 +9,9 @@ from decimal import Decimal
 
 import pytest
 
-from app.mapping.mapper import FieldMapper, MappingConfigError, MappingError, MappingRegistry
-from tests.conftest import MAPPING_DIR
+from app.mapping.mapper import FieldMapper, MappingConfigError, MappingError
+from tests.support.mappings import MappingRegistry
+from tests.support.data import MAPPING_DIR
 
 BASE_CONFIG = {
     "tenant_id": "acme",

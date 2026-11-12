@@ -1,20 +1,15 @@
-from typing import Annotated
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.api.admin import router as admin_router
-from app.api.deps import get_engine
 from app.api.ops import router as ops_router
 from app.api.sync import router as sync_router
 from app.api.webhooks import router as webhooks_router
-from app.auth.dependencies import require
-from app.auth.permissions import Permission
-from app.auth.tokens import Principal
+from app.api.dependencies import get_engine
 from app.core.config import get_settings
-from app.repositories.sync_history import RepositoryError, RepositoryUnavailableError
-from app.schemas.account import AccountCreate
+from app.db.errors import RepositoryError, RepositoryUnavailableError
 
 # Fail fast on unsafe configuration (e.g. dev secrets in production).
 _settings = get_settings()
@@ -35,20 +30,16 @@ app.include_router(ops_router)
 
 @app.exception_handler(RepositoryError)
 def repository_error_handler(_request: Request, exc: RepositoryError) -> JSONResponse:
-    unavailable = isinstance(exc, RepositoryUnavailableError)
-    return JSONResponse(
-        status_code=503 if unavailable else 500,
-        content={"detail": "Sync history storage unavailable" if unavailable
-                 else "Sync history storage error"},
-    )
+    """Fallback for database errors a route didn't handle itself (any repository, not only history)."""
+    if isinstance(exc, RepositoryUnavailableError):
+        return JSONResponse(status_code=503, content={"detail": "database unavailable; retry later"})
+    return JSONResponse(status_code=500, content={"detail": "database error"})
 
 
 @app.get("/health/ready")
 def readiness():
-    """Readiness: the database (if configured) answers a trivial query."""
+    """Readiness: the database answers a trivial query."""
     engine = get_engine()
-    if engine is None:
-        return {"status": "ready", "database": "not_configured"}
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -62,14 +53,3 @@ def health_check():
   "status": "healthy",
   "service": "integrationlab"
 }
-    
-    
-@app.post("/accounts", status_code=201)
-def create_account(account: AccountCreate,
-                   _principal: Annotated[Principal, Depends(require(Permission.SYNC_RUN))]):
-    """Legacy M1 intake endpoint (validates and echoes). Now requires sync:run."""
-    return {
-        "message": "Account recieved successfully",
-        "account": account
-    }
-    

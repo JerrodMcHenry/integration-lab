@@ -7,21 +7,19 @@ from contextlib import contextmanager
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.deps import build_lock_provider, get_sync_history, get_sync_service, worst_case_sync_seconds
+from app.api.dependencies import get_sync_history, get_sync_service
+from app.wiring import build_lock_provider
+from app.core.config import worst_case_sync_seconds
 from app.core.config import ConfigurationError, DatabaseSettings, load_settings
 from app.main import app
-from app.mapping.mapper import MappingRegistry
-from app.repositories.sync_history import InMemorySyncHistoryRepository
+from tests.support.mappings import MappingRegistry
+from tests.support.fakes import InMemorySyncHistoryRepository
 from app.schemas.sync import SyncStage, SyncStatus
 from app.services.account_sync import AccountSyncService, HistoryPersistenceError
-from app.services.locks import (
-    InProcessSyncLocks,
-    LockTimeoutError,
-    LockUnavailableError,
-    PostgresAdvisorySyncLocks,
-    advisory_lock_key,
-)
-from tests.conftest import MAPPING_DIR, cms_settings, crm_settings
+from app.services.locks import LockTimeoutError, LockUnavailableError, PostgresAdvisorySyncLocks, advisory_lock_key
+from tests.support.clients import cms_settings, crm_settings
+from tests.support.data import MAPPING_DIR
+from tests.support.fakes import InProcessSyncLocks, StaticConnections
 
 T = "meridian"
 
@@ -42,9 +40,9 @@ class BrokenHistory(InMemorySyncHistoryRepository):
 
 
 def service(crm_client, cms_client, *, locks=None, history=None):
-    return AccountSyncService(crm=crm_client, destination=cms_client,
+    return AccountSyncService(connections=StaticConnections(crm_client, cms_client),
                               mappings=MappingRegistry(MAPPING_DIR),
-                              history=history or InMemorySyncHistoryRepository(), locks=locks)
+                              history=history or InMemorySyncHistoryRepository(), locks=locks or InProcessSyncLocks())
 
 
 @pytest.mark.parametrize("exc, code", [(LockTimeoutError("busy"), "sync_lock_timeout"),
@@ -104,8 +102,29 @@ def test_lock_key_is_stable_signed_64bit_and_scoped():
     assert advisory_lock_key("a", "bc") != advisory_lock_key("ab", "c")
 
 
-def test_in_process_locks_used_without_database():
-    assert isinstance(build_lock_provider(load_settings(), None), InProcessSyncLocks)
+def test_lock_provider_is_always_postgres():
+    provider = build_lock_provider(load_settings(), engine=object())  # engine unused until hold()
+    assert isinstance(provider, PostgresAdvisorySyncLocks)
+
+
+@pytest.mark.parametrize("app_env", ["development", "test", "production"])
+def test_database_url_required_in_every_environment(monkeypatch, app_env):
+    monkeypatch.setenv("APP_ENV", app_env)
+    monkeypatch.setenv("DATABASE_URL", "")  # empty: load_dotenv() won't refill it from .env
+    with pytest.raises(ConfigurationError, match="DATABASE_URL is required"):
+        load_settings()
+
+
+@pytest.mark.parametrize("command", [["-c", "import app.main"], ["-m", "app.worker", "--once"],
+                                     ["-m", "app.cli", "retention"]])
+def test_entry_points_fail_fast_without_database(command):
+    import os
+    import subprocess
+    import sys
+    env = {**os.environ, "DATABASE_URL": "", "APP_ENV": "development"}
+    r = subprocess.run([sys.executable, *command], env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0
+    assert "DATABASE_URL is required" in r.stderr
 
 
 def test_lock_backstop_exceeds_worst_case_sync_duration():
@@ -128,10 +147,7 @@ def test_database_settings_validation(kwargs):
 
 
 def test_production_requires_database_url(monkeypatch):
-    for k, v in {"APP_ENV": "production", "CRM_BASE_URL": "https://crm.example.com",
-                 "CRM_CLIENT_SECRET": "real", "INTERNAL_API_BASE_URL": "https://cms.example.com",
-                 "INTERNAL_API_KEY": "real", "DATABASE_URL": ""}.items():
+    for k, v in {"APP_ENV": "production", "DATABASE_URL": ""}.items():
         monkeypatch.setenv(k, v)
-    monkeypatch.delenv("CRM_TOKEN_URL", raising=False)
     with pytest.raises(ConfigurationError, match="DATABASE_URL is required"):
         load_settings()

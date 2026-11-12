@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import random
-import threading
 import time
 from datetime import timedelta
 
@@ -11,37 +9,12 @@ import pytest
 from sqlalchemy import text
 
 from app.core.config import RetrySettings
+from app.repositories.operations import PostgresOperationsRepository
 from app.repositories.webhook_events import Outcome, PostgresWebhookEventRepository
 from app.worker.retry_policy import RetryPolicy
-from mock_crm import main as mock_crm
-from tests.integration.test_pg_worker import by_id, service, world  # noqa: F401 (fixtures)
-from tests.integration.webhook_helpers import build_service, build_worker, ingest_direct
-
-
-def fast_policy(max_attempts=4, base=0.2, cap=0.6, seed=7):
-    return RetryPolicy(RetrySettings(base_delay_seconds=base, max_delay_seconds=cap), max_attempts, random.Random(seed))
-
-
-def attempts(engine, eid):
-    with engine.connect() as c:
-        return [dict(r._mapping) for r in c.execute(text(
-            "SELECT attempt, outcome, error_code, retryable, next_attempt_at, finished_at, worker_id "
-            "FROM webhook_event_attempts WHERE event_uuid = :e ORDER BY id"), {"e": eid})]
-
-
-def crm_fault(world, remaining, tenant="meridian"):
-    world.crm[tenant].state.crm.fault = mock_crm.FaultConfig(mode="error", remaining=remaining, status_code=503)
-
-
-def drain(engine, svc, *, policy, until, timeout=15.0, **kw):
-    w = build_worker(engine, svc, max_attempts=policy.max_attempts, retry_policy=policy, **kw)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        w.run_once()
-        if until():
-            return w
-        time.sleep(0.05)
-    raise AssertionError("condition not reached")
+from tests.support.webhooks import attempts, by_id, crm_fault, drain, fast_policy
+from tests.support.webhooks import build_service, build_worker, ingest_direct
+from tests.support.concurrency import join_all, start_threads
 
 
 # --------------------------------------------------------------------------- #
@@ -165,7 +138,7 @@ def test_processing_deadline_blocks_destination_write(pg_engine, world, service)
 def test_lost_advisory_lock_detected_before_destination_write(pg_engine, pg_url, world):
     """Kill the lock session after the CRM read but before the CMS write: the write is refused."""
     from app.db.engine import build_engine
-    from tests.integration.conftest import db_settings
+    from tests.support.db import db_settings
     admin = build_engine(db_settings(pg_url), application_name="killer")
     killed = []
 
@@ -206,11 +179,8 @@ def test_concurrent_workers_with_retries_process_each_event_exactly_to_completio
             w.run_once()
             time.sleep(0.02)
 
-    threads = [threading.Thread(target=loop, args=(w,)) for w in workers]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    threads = start_threads([lambda w=w: loop(w) for w in workers], name="worker")
+    join_all(threads, timeout=60, what="4 worker threads draining 24 events (loop deadline 30s)")
     rows = by_id(pg_engine)
     assert done(), {r["status"] for r in rows.values()}
     assert sum(w.stats.retried for w in workers) >= 1
@@ -225,15 +195,15 @@ def test_concurrent_workers_with_retries_process_each_event_exactly_to_completio
 # Database outages
 # --------------------------------------------------------------------------- #
 def test_heartbeat_failure_does_not_stop_processing(pg_engine, world, service):
-    from app.repositories.sync_history import RepositoryUnavailableError
+    from app.db.errors import RepositoryUnavailableError
     [eid] = ingest_direct(pg_engine, 1)
     w = build_worker(pg_engine, service)
 
-    class NoHeartbeat(PostgresWebhookEventRepository):
+    class NoHeartbeat(PostgresOperationsRepository):
         def heartbeat(self, **kw):
             raise RepositoryUnavailableError("down")
 
-    w._events = NoHeartbeat(pg_engine)
+    w._operations = NoHeartbeat(pg_engine)
     w.run_once()
     assert by_id(pg_engine)[eid]["status"] == "succeeded"
 

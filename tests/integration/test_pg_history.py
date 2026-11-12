@@ -3,31 +3,22 @@
 from __future__ import annotations
 
 import multiprocessing
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import text
 
 from app.db.engine import build_engine
-from app.repositories.sync_history import (
-    InMemorySyncHistoryRepository,
-    PostgresSyncHistoryRepository,
-    RepositoryError,
-    RepositoryUnavailableError,
-)
+from app.db.errors import RepositoryError, RepositoryUnavailableError
+from app.repositories.sync_history import PostgresSyncHistoryRepository
+from tests.support.fakes import InMemorySyncHistoryRepository
 from app.schemas.sync import SyncErrorDetail, SyncRecord, SyncStage, SyncStatus
 from tests.integration import _workers
-from tests.integration.conftest import db_settings
+from tests.support.db import db_settings, rec
+from tests.support.concurrency import pool_results
 
 T = "meridian"
 NOW = datetime(2026, 11, 11, 12, 0, tzinfo=timezone.utc)
-
-
-def rec(account="SF-1", status=SyncStatus.UPDATED, tenant=T, **kw) -> SyncRecord:
-    values = dict(tenant_id=tenant, crm_account_id=account, status=status, started_at=NOW,
-                  finished_at=NOW + timedelta(milliseconds=5), duration_ms=5, mapping_version=1)
-    values.update(kw)
-    return SyncRecord(**values)
 
 
 def failed(account="SF-1", **kw) -> SyncRecord:
@@ -105,8 +96,9 @@ def test_persists_across_engine_restart(pg_url, pg_engine):
 def test_persists_across_process_restart(pg_url, pg_engine):
     """A separate OS process writes and exits; this process reads it back."""
     ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(1) as pool:
-        record_id = pool.apply(_workers.write_then_exit, (pg_url, T, "SF-PROC"))
+    with ctx.Pool(1) as pool:  # __exit__ terminates the pool, even on failure
+        [record_id] = pool_results([pool.apply_async(_workers.write_then_exit, (pg_url, T, "SF-PROC"))],
+                                   timeout=60, what="child process writing a history record")
     found = PostgresSyncHistoryRepository(pg_engine).list_recent(T, crm_account_id="SF-PROC")
     assert [str(r.id) for r in found] == [record_id]
 

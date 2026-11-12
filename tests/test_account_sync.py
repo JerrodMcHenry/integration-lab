@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import logging
-import threading
 
 import pytest
 
 from app.integrations.internal_client import InternalSystemClient
-from app.mapping.mapper import MappingRegistry
-from app.repositories.sync_history import InMemorySyncHistoryRepository
+from tests.support.mappings import MappingRegistry
+from tests.support.fakes import InMemorySyncHistoryRepository
 from app.schemas.sync import SyncStage, SyncStatus
 from app.services.account_sync import AccountSyncService, OwnershipViolationError, _assert_crm_owned_only
-from tests.conftest import MAPPING_DIR, cms_headers, cms_settings, crm_patch
+from tests.support.clients import cms_headers, cms_settings, crm_patch
+from tests.support.data import MAPPING_DIR
+from tests.support.concurrency import join_all, start_threads
+from tests.support.fakes import InProcessSyncLocks, StaticConnections
 
 T = "meridian"
 
@@ -69,12 +71,8 @@ def test_duplicate_sync_is_idempotent_and_writes_nothing(sync_service, cms_app):
 
 def test_concurrent_duplicate_syncs_create_one_customer(sync_service, cms_app):
     results = []
-    threads = [threading.Thread(target=lambda: results.append(sync_service.sync_account(T, "SF-1001")))
-               for _ in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    threads = start_threads([lambda: results.append(sync_service.sync_account(T, "SF-1001"))] * 8)
+    join_all(threads, timeout=60, what="8 concurrent syncs of SF-1001")
 
     assert len(cms_app.app.state.cms.customers) == 1
     assert sorted(r.status.value for r in results).count("created") == 1
@@ -97,8 +95,8 @@ def test_create_race_with_other_writer_falls_back_to_update(crm_client, cms_app,
             return super().get_customer_by_external_id(external_crm_id)
 
     service = AccountSyncService(
-        crm=crm_client, destination=RacyDestination(cms_settings(), http_client=cms_app),
-        mappings=MappingRegistry(MAPPING_DIR), history=history)
+        connections=StaticConnections(crm_client, RacyDestination(cms_settings(), http_client=cms_app)),
+        mappings=MappingRegistry(MAPPING_DIR), history=history, locks=InProcessSyncLocks())
     result = service.sync_account(T, "SF-1001")
 
     assert result.status is SyncStatus.UPDATED
@@ -206,9 +204,9 @@ def test_destination_recovers_and_retry_succeeds(sync_service, cms_app, history)
 
 def test_destination_auth_failure_is_permanent(crm_client, cms_app, history):
     service = AccountSyncService(
-        crm=crm_client,
-        destination=InternalSystemClient(cms_settings(api_key="wrong"), http_client=cms_app),
-        mappings=MappingRegistry(MAPPING_DIR), history=history)
+        connections=StaticConnections(
+            crm_client, InternalSystemClient(cms_settings(api_key="wrong"), http_client=cms_app)),
+        mappings=MappingRegistry(MAPPING_DIR), history=history, locks=InProcessSyncLocks())
     result = service.sync_account(T, "SF-1001")
     assert result.error.code == "destination_auth_failed" and result.error.retryable is False
 
@@ -248,8 +246,8 @@ def test_unexpected_exception_is_recorded_not_swallowed(crm_client, cms_client, 
         def get(self, tenant_id):
             raise RuntimeError("bug")
 
-    service = AccountSyncService(crm=crm_client, destination=cms_client,
-                                 mappings=Boom(MAPPING_DIR), history=history)
+    service = AccountSyncService(connections=StaticConnections(crm_client, cms_client),
+                                 mappings=Boom(MAPPING_DIR), history=history, locks=InProcessSyncLocks())
     with caplog.at_level(logging.ERROR):
         result = service.sync_account(T, "SF-1001")
     assert result.stage is SyncStage.INTERNAL and result.error.code == "unexpected_error"

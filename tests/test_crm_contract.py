@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import socket
-import threading
 import time
 
 import httpx
 import pytest
-import uvicorn
 
 from app.integrations.crm_client import (
     CRMAuthError,
@@ -18,7 +15,8 @@ from app.integrations.crm_client import (
     CRMUnavailableError,
 )
 from mock_crm import main as mock_crm
-from tests.conftest import crm_patch, crm_settings, crm_token
+from tests.support.clients import crm_patch, crm_settings, crm_token
+from tests.support.servers import LiveServer
 
 
 def test_fetch_account_end_to_end(crm_client):
@@ -120,18 +118,8 @@ def test_injected_fault_exceeding_retry_budget_surfaces_error(crm_app):
 
 def test_injected_timeout_against_live_server():
     """Real socket timeout: run the mock CRM under uvicorn on an ephemeral port."""
-    app = mock_crm.create_app(app_env="test")
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(app, log_level="warning"))
-    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
-    thread.start()
-    try:
-        deadline = time.time() + 5
-        while not server.started and time.time() < deadline:
-            time.sleep(0.02)
-        base = f"http://127.0.0.1:{port}"
+    with LiveServer(mock_crm.create_app(app_env="test")) as server:
+        base = server.url
         httpx.put(f"{base}/_admin/faults", json={"mode": "timeout", "remaining": 1, "delay_seconds": 2})
         client = CRMClient(crm_settings(base_url=base, token_url=f"{base}/oauth/token",
                                         timeout_seconds=0.3, max_retries=0))
@@ -140,6 +128,3 @@ def test_injected_timeout_against_live_server():
             client.get_account("SF-1001")
         assert time.monotonic() - started < 1.5
         client.close()
-    finally:
-        server.should_exit = True
-        thread.join(timeout=5)

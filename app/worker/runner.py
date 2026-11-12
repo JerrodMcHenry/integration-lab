@@ -37,9 +37,10 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from app.core.config import RetrySettings, Settings
-from app.repositories.sync_history import RepositoryError
+from app.core.config import RetrySettings, Settings, worst_case_sync_seconds
+from app.db.errors import RepositoryError
 from app.repositories.tenants import TenantRepository
+from app.repositories.operations import PostgresOperationsRepository
 from app.repositories.webhook_events import ClaimedEvent, Outcome, PostgresWebhookEventRepository
 from app.schemas.sync import SyncStatus
 from app.services.account_sync import AccountSyncService, HistoryPersistenceError, OwnershipLost
@@ -68,15 +69,7 @@ def default_worker_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
 
 
-def destination_write_margin(settings: Settings) -> float:
-    """Worst-case duration of ONE destination call (timeouts, in-client retries, backoff)."""
-    c = settings.internal
-    return (c.max_retries + 1) * c.timeout_seconds + c.max_retries * c.backoff_max_seconds
-
-
 def resolve_lease_seconds(settings: Settings) -> float:
-    from app.api.deps import worst_case_sync_seconds
-
     worst = worst_case_sync_seconds(settings.crm, settings.internal)
     # The sync may also wait up to lock_timeout for another worker holding the same account.
     needed = worst + settings.database.lock_timeout_seconds
@@ -89,13 +82,15 @@ def resolve_lease_seconds(settings: Settings) -> float:
 
 
 class EventWorker:
-    def __init__(self, *, events: PostgresWebhookEventRepository, service: AccountSyncService,
+    def __init__(self, *, events: PostgresWebhookEventRepository, operations: PostgresOperationsRepository | None,
+                 service: AccountSyncService,
                  tenants: TenantRepository, lease_seconds: float, batch_size: int, max_attempts: int,
                  poll_interval: float, worker_id: str | None = None,
                  sleep: Callable[[float], None] = time.sleep,
                  retry_policy: RetryPolicy | None = None, write_margin_seconds: float = 0.0,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._events = events
+        self._operations = operations
         self._service = service
         self._tenants = tenants
         self._lease = lease_seconds
@@ -164,8 +159,10 @@ class EventWorker:
 
     def _beat(self, state: str, current_event=None) -> None:
         """Best-effort liveness record; never interrupts processing."""
+        if self._operations is None:
+            return
         try:
-            self._events.heartbeat(worker_id=self.worker_id, hostname=self._hostname, pid=os.getpid(),
+            self._operations.heartbeat(worker_id=self.worker_id, hostname=self._hostname, pid=os.getpid(),
                                    state=state, current_event_id=current_event,
                                    succeeded=self.stats.succeeded, failed=self.stats.failed + self.stats.dead_lettered)
         except Exception as exc:  # noqa: BLE001

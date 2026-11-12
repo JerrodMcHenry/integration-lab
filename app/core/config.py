@@ -10,18 +10,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 
 from dotenv import load_dotenv
 
 from app.integrations.retry import MAX_RETRIES_CEILING
 
 PRODUCTION_ENVS = frozenset({"production", "prod", "staging"})
-
-# Dev-only defaults. They match the mock services and are rejected in production.
-DEV_CRM_CLIENT_SECRET = "dev-only-secret"
-DEV_INTERNAL_API_KEY = "dev-only-internal-key"
-
 
 class ConfigurationError(RuntimeError):
     """Raised when the environment configuration is unsafe or invalid."""
@@ -48,7 +42,29 @@ def _validate_http(prefix: str, timeout: float, retries: int, base: float, cap: 
 
 
 @dataclass(frozen=True)
+class HttpPolicy:
+    """Platform-wide timeout/retry policy for one external system.
+
+    Connection details (URLs, client ids, secrets) are per tenant, in
+    ``tenant_integrations``; ``TenantConnectionProvider`` combines the two into
+    ``CRMSettings`` / ``InternalSystemSettings`` for each tenant's clients.
+    """
+
+    timeout_seconds: float
+    max_retries: int
+    backoff_base_seconds: float
+    backoff_max_seconds: float
+    env_prefix: str = "HTTP"
+
+    def __post_init__(self) -> None:
+        _validate_http(self.env_prefix, self.timeout_seconds, self.max_retries,
+                       self.backoff_base_seconds, self.backoff_max_seconds)
+
+
+@dataclass(frozen=True)
 class CRMSettings:
+    """One tenant's CRM connection (built per tenant; never loaded from global env)."""
+
     base_url: str
     token_url: str
     client_id: str
@@ -65,6 +81,8 @@ class CRMSettings:
 
 @dataclass(frozen=True)
 class InternalSystemSettings:
+    """One tenant's internal CMS connection (built per tenant; never loaded from global env)."""
+
     base_url: str
     api_key: str
     timeout_seconds: float
@@ -79,8 +97,7 @@ class InternalSystemSettings:
 
 @dataclass(frozen=True)
 class DatabaseSettings:
-    #: SQLAlchemy URL, e.g. postgresql+psycopg://user:pass@host:5432/db. ``None``
-    #: selects in-memory storage (development/test only).
+    #: SQLAlchemy URL, e.g. postgresql+psycopg://user:pass@host:5432/db. Required.
     url: str | None
     pool_size: int = 10
     max_overflow: int = 10
@@ -202,8 +219,9 @@ class RetentionSettings:
 @dataclass(frozen=True)
 class Settings:
     environment: str
-    crm: CRMSettings
-    internal: InternalSystemSettings
+    #: Timeout/retry policy only; connection details are per tenant.
+    crm: HttpPolicy
+    internal: HttpPolicy
     database: DatabaseSettings
     oidc: OIDCSettings
     webhooks: WebhookSettings
@@ -212,19 +230,16 @@ class Settings:
     retention: RetentionSettings
     #: Bearer token for the platform-wide Prometheus endpoint. Unset = endpoint disabled.
     metrics_token: str | None
-    mapping_config_dir: Path
-    #: Tenant used only by the database-less development fallback.
-    default_tenant_id: str
 
     @property
     def is_production(self) -> bool:
         return self.environment.lower() in PRODUCTION_ENVS
 
     def __post_init__(self) -> None:
+        if not self.database.url:
+            raise ConfigurationError("DATABASE_URL is required: IntegrationLab needs PostgreSQL in every environment")
         if self.is_production:
             problems = []
-            if not self.database.url:
-                problems.append("DATABASE_URL is required in production")
             if not self.oidc.issuer.startswith("https://"):
                 problems.append("OIDC_ISSUER must use https in production")
             if self.oidc.issuer.rstrip("/") == DEV_OIDC_ISSUER:
@@ -233,41 +248,51 @@ class Settings:
                 problems.append("METRICS_TOKEN must be at least 32 characters in production")
             if self.oidc.jwks_url and not self.oidc.jwks_url.startswith("https://"):
                 problems.append("OIDC_JWKS_URL must use https in production")
-            if self.crm.client_secret == DEV_CRM_CLIENT_SECRET:
-                problems.append("CRM_CLIENT_SECRET uses the development default")
-            if self.internal.api_key == DEV_INTERNAL_API_KEY:
-                problems.append("INTERNAL_API_KEY uses the development default")
-            for name, url in (("CRM_BASE_URL", self.crm.base_url),
-                              ("INTERNAL_API_BASE_URL", self.internal.base_url)):
-                if not url.startswith("https://"):
-                    problems.append(f"{name} must use https in production")
             if problems:
                 raise ConfigurationError("Unsafe production configuration: " + "; ".join(problems))
+
+
+# --------------------------------------------------------------------------- #
+# Derived timing bounds (used for the lock backstop, worker lease and write deadline)
+# --------------------------------------------------------------------------- #
+def worst_case_sync_seconds(crm: HttpPolicy, internal: HttpPolicy) -> float:
+    """Upper bound on how long one sync can hold its lock.
+
+    CRM: token fetch + account fetch with retries. CMS: up to 3 calls with
+    retries (lookup, create or conflict re-lookup, update).
+    """
+    def call(timeout: float, retries: int, cap: float) -> float:
+        return (retries + 1) * timeout + retries * cap
+
+    crm_s = crm.timeout_seconds + call(crm.timeout_seconds, crm.max_retries, crm.backoff_max_seconds)
+    cms_s = 3 * call(internal.timeout_seconds, internal.max_retries, internal.backoff_max_seconds)
+    return crm_s + cms_s
+
+
+def destination_write_margin(settings: Settings) -> float:
+    """Worst-case duration of ONE destination call (timeouts, in-client retries, backoff)."""
+    c = settings.internal
+    return (c.max_retries + 1) * c.timeout_seconds + c.max_retries * c.backoff_max_seconds
 
 
 def load_settings() -> Settings:
     """Build settings from the current environment (uncached)."""
     load_dotenv()
-    crm_base = os.getenv("CRM_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
     return Settings(
         environment=os.getenv("APP_ENV", "development"),
-        crm=CRMSettings(
-            base_url=crm_base,
-            token_url=os.getenv("CRM_TOKEN_URL", f"{crm_base}/oauth/token"),
-            client_id=os.getenv("CRM_CLIENT_ID", "integrationlab-dev"),
-            client_secret=os.getenv("CRM_CLIENT_SECRET", DEV_CRM_CLIENT_SECRET),
+        crm=HttpPolicy(
             timeout_seconds=_env_float("CRM_TIMEOUT_SECONDS", 5.0),
             max_retries=_env_int("CRM_MAX_RETRIES", 2),
             backoff_base_seconds=_env_float("CRM_BACKOFF_BASE_SECONDS", 0.5),
             backoff_max_seconds=_env_float("CRM_BACKOFF_MAX_SECONDS", 4.0),
+            env_prefix="CRM",
         ),
-        internal=InternalSystemSettings(
-            base_url=os.getenv("INTERNAL_API_BASE_URL", "http://127.0.0.1:8002").rstrip("/"),
-            api_key=os.getenv("INTERNAL_API_KEY", DEV_INTERNAL_API_KEY),
+        internal=HttpPolicy(
             timeout_seconds=_env_float("INTERNAL_API_TIMEOUT_SECONDS", 5.0),
             max_retries=_env_int("INTERNAL_API_MAX_RETRIES", 2),
             backoff_base_seconds=_env_float("INTERNAL_API_BACKOFF_BASE_SECONDS", 0.5),
             backoff_max_seconds=_env_float("INTERNAL_API_BACKOFF_MAX_SECONDS", 4.0),
+            env_prefix="INTERNAL_API",
         ),
         database=DatabaseSettings(
             url=os.getenv("DATABASE_URL") or None,
@@ -311,10 +336,6 @@ def load_settings() -> Settings:
             batch_size=_env_int("RETENTION_BATCH_SIZE", 1000),
         ),
         metrics_token=os.getenv("METRICS_TOKEN") or None,
-        mapping_config_dir=Path(
-            os.getenv("MAPPING_CONFIG_DIR", Path(__file__).resolve().parent.parent / "mapping" / "configs")
-        ),
-        default_tenant_id=os.getenv("DEFAULT_TENANT_ID", "meridian"),
     )
 
 

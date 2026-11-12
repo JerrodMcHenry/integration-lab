@@ -22,7 +22,7 @@ from typing import Protocol
 
 import httpx
 
-from app.core.config import CRMSettings, InternalSystemSettings
+from app.core.config import CRMSettings, HttpPolicy, InternalSystemSettings
 from app.integrations.crm_client import CRMClient
 from app.integrations.internal_client import InternalSystemClient
 from app.mapping.mapper import FieldMapper, MappingConfigError
@@ -45,24 +45,18 @@ class ConnectionProvider(Protocol):
     def for_tenant(self, tenant_id: str) -> TenantClients: ...
 
 
-class StaticConnections:
-    """One fixed pair of clients for every tenant (single-tenant tests and fallback)."""
-
-    def __init__(self, crm: CRMClient, destination: InternalSystemClient) -> None:
-        self._clients = TenantClients(crm, destination)
-
-    def for_tenant(self, tenant_id: str) -> TenantClients:
-        return self._clients
-
-
 class TenantConnectionProvider:
     def __init__(self, repo: TenantRepository, secrets: EnvSecretResolver, *,
-                 crm_defaults: CRMSettings, cms_defaults: InternalSystemSettings,
+                 crm_defaults: HttpPolicy, cms_defaults: HttpPolicy,
+                 require_https: bool = False,
                  max_cached: int = 256,
                  http_client_factory: Callable[[str], httpx.Client] | None = None) -> None:
         self._repo = repo
         self._http_factory = http_client_factory  # tests route base URLs to in-process mocks
         self._secrets = secrets
+        #: Production: tenant CRM/CMS endpoints must be HTTPS (replaces the former
+        #: global CRM_BASE_URL / INTERNAL_API_BASE_URL https checks).
+        self._require_https = require_https
         self._crm_defaults = crm_defaults
         self._cms_defaults = cms_defaults
         self._cache: OrderedDict[tuple[str, str], TenantClients] = OrderedDict()
@@ -73,6 +67,13 @@ class TenantConnectionProvider:
         integration = self._repo.get_integration(tenant_id)
         if integration is None or integration.tenant_id != tenant_id:
             raise TenantConnectionError("tenant has no integration configured")
+        if self._require_https:
+            insecure = [name for name, url in (("crm_base_url", integration.crm_base_url),
+                                               ("crm_token_url", integration.crm_token_url),
+                                               ("cms_base_url", integration.cms_base_url))
+                        if not url.startswith("https://")]
+            if insecure:
+                raise TenantConnectionError(f"tenant endpoints must use https in production: {insecure}")
         try:
             crm_secret = self._secrets.resolve(tenant_id, integration.crm_client_secret_ref)
             cms_key = self._secrets.resolve(tenant_id, integration.cms_api_key_ref)

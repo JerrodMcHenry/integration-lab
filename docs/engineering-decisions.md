@@ -106,7 +106,8 @@ always returns the record body.
 (or when explicitly opted in for an unrecognised env). In
 production/prod/staging the routes are never registered, and explicitly
 enabling them raises at startup. IntegrationLab refuses to start in production
-if dev-default secrets or non-HTTPS upstream URLs are configured.
+if dev-default secrets or non-HTTPS upstream URLs are configured. *(Phase 3: global CRM/CMS credentials were
+removed; the HTTPS rule now applies to each tenant's endpoints, and `dev-only*` tenant secrets are refused.)*
 **Why:** Fault injection and data seeding endpoints are dangerous if exposed.
 Failing at startup makes the misconfiguration obvious instead of silently
 ignoring it.
@@ -315,3 +316,24 @@ fixtures do exactly that, only in the `_test` database.
 switch. Only terminal-success/ignored events and unreferenced sync records are eligible.
 **Why:** The user's constraint (no destructive cleanup without approval), and
 failed/dead-lettered events are exactly the ones operators still need.
+
+## ED-037 — Phase 3 simplification: one runtime mode, per-tenant configuration only
+**Decisions:**
+- **PostgreSQL is required everywhere.** The database-less runtime mode
+  (in-memory history, tenants and audit, in-process locks, readiness
+  `not_configured`) was removed. Those in-memory implementations remain only
+  as test fakes in `tests/support/fakes.py`.
+- **Global CRM/CMS credentials removed.** `CRM_BASE_URL`, `CRM_TOKEN_URL`,
+  `CRM_CLIENT_ID`, `CRM_CLIENT_SECRET`, `INTERNAL_API_BASE_URL` and
+  `INTERNAL_API_KEY` were only validated, never used, since tenant connections
+  arrived (M5). Global config now carries only an `HttpPolicy` (timeouts,
+  retries). The former production HTTPS rule moved to where URLs are actually
+  used: each tenant's endpoints (`TenantConnectionProvider(require_https=...)`).
+- **One `AccountSyncService` constructor** (`connections`, `mappings`, `history`,
+  `locks`, all required). No silent in-process lock default.
+- **Legacy `POST /accounts` removed** (an M1 echo endpoint with no consumers).
+- **Fail-safe test database isolation:** the test process replaces
+  `DATABASE_URL` with an unroutable sentinel before importing the app.
+  Destructive fixtures use only a validated `TEST_DATABASE_URL`.
+**Why:** one runtime mode to reason about, configuration that reflects what's
+actually used, and no path by which a test can touch development data.

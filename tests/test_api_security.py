@@ -11,13 +11,11 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_sync_history, get_sync_service
+from app.api.dependencies import get_sync_history, get_sync_service
 from app.main import app
-from tests.auth_helpers import new_rsa_key
+from tests.support.identity import new_rsa_key
+from tests.support.data import HARBOR_MAPPING, MAPPING, ROOT
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MAPPING = json.load(open(os.path.join(ROOT, "app", "mapping", "configs", "meridian.json")))
-HARBOR_MAPPING = json.load(open(os.path.join(ROOT, "app", "mapping", "configs", "harbor.json")))
 
 PROTECTED = [
     ("POST", "/sync/accounts/SF-1001", None),
@@ -29,7 +27,6 @@ PROTECTED = [
     ("GET", "/admin/mapping", None),
     ("GET", "/admin/mapping/versions", None),
     ("PUT", "/admin/mapping", MAPPING),
-    ("POST", "/accounts", {"account_id": "x", "account_name": "y", "relationship_manager": "z"}),
 ]
 
 
@@ -225,25 +222,31 @@ def test_health_endpoints_are_public(client):
 
 
 def test_idp_outage_returns_503_not_401(auth, tenant_repo):
-    from app.auth import dependencies as auth_deps
+    from app.api import dependencies as deps
     from app.auth.tokens import IdentityProviderUnavailable, JWKSCache, TokenVerifier
 
     def down():
         raise IdentityProviderUnavailable("down")
 
-    app.dependency_overrides[auth_deps.get_token_verifier] = lambda: TokenVerifier(
+    app.dependency_overrides[deps.get_token_verifier] = lambda: TokenVerifier(
         auth.settings(), JWKSCache(down, ttl_seconds=600))
     r = TestClient(app).get("/me", headers=auth.headers())
     assert r.status_code == 503 and r.json()["detail"] == "identity provider unavailable"
 
 
 def test_docs_disabled_in_production():
-    env = {**os.environ, "APP_ENV": "production", "CRM_BASE_URL": "https://crm.example.com",
-           "CRM_CLIENT_SECRET": "x", "INTERNAL_API_BASE_URL": "https://cms.example.com",
-           "INTERNAL_API_KEY": "y", "DATABASE_URL": "postgresql+psycopg://u@db.example.com/d",
+    env = {**os.environ, "APP_ENV": "production", "DATABASE_URL": "postgresql+psycopg://u@db.example.com/d",
            "OIDC_ISSUER": "https://login.example.com", "OIDC_JWKS_URL": ""}
     code = ("from app.main import app; "
             "print(app.openapi_url, app.docs_url, app.redoc_url)")
     out = subprocess.run([sys.executable, "-c", code], env=env, cwd=ROOT, capture_output=True, text=True)
     assert out.returncode == 0, out.stderr[-500:]
     assert out.stdout.strip() == "None None None"
+
+
+def test_legacy_accounts_endpoint_removed(client, auth):
+    """Phase 3: the M1 echo endpoint (validated and returned the body, stored nothing) was removed."""
+    r = client.post("/accounts", json={"account_id": "x", "account_name": "y", "relationship_manager": "z"},
+                    headers=auth.headers("admin"))
+    assert r.status_code == 404
+    assert "/accounts" not in client.get("/openapi.json").json()["paths"]

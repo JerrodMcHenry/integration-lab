@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_sync_history, get_sync_service
+from app.api.dependencies import get_sync_history, get_sync_service
 from app.main import app
 
 

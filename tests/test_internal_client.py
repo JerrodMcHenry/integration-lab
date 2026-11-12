@@ -13,7 +13,7 @@ from app.integrations.internal_client import (
     InternalUnavailableError,
     InternalValidationError,
 )
-from tests.conftest import cms_settings
+from tests.support.clients import cms_settings
 
 NEW = {"external_crm_id": "SF-1", "legal_name": "Acme", "relationship_manager": "Pat"}
 

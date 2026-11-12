@@ -1,11 +1,8 @@
 """Per-(tenant, CRM account) mutual exclusion for synchronization.
 
-Two implementations share the ``SyncLockProvider`` contract:
-
-* ``InProcessSyncLocks``: striped ``threading.Lock``s. Covers one process
-  only. Used by unit tests and by local runs without a database.
-* ``PostgresAdvisorySyncLocks``: PostgreSQL transaction-scoped advisory
-  locks. Covers every process and host that uses the same database.
+``PostgresAdvisorySyncLocks`` implements the ``SyncLockProvider`` contract with
+session-level PostgreSQL advisory locks, covering every process and host that
+uses the same database. (Unit tests use ``tests/support/fakes.InProcessSyncLocks``.)
 
 Lock lifecycle (PostgreSQL), revised in Milestone 6
 ---------------------------------------------------
@@ -40,7 +37,6 @@ accounts serialise (a performance issue, never a correctness one).
 from __future__ import annotations
 
 import hashlib
-import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Protocol
@@ -78,11 +74,6 @@ class LockHandle(Protocol):
         """Raise ``LockLostError`` unless this process still holds the lock."""
 
 
-class _AlwaysHeld:
-    def verify(self) -> None:
-        return None
-
-
 class SyncLockProvider(Protocol):
     def hold(self, tenant_id: str, crm_account_id: str):  # -> ContextManager[LockHandle]
         ...
@@ -91,19 +82,6 @@ class SyncLockProvider(Protocol):
 def advisory_lock_key(tenant_id: str, crm_account_id: str) -> int:
     digest = hashlib.sha256(f"{tenant_id}\x00{crm_account_id}".encode()).digest()
     return int.from_bytes(digest[:8], "big", signed=True)
-
-
-class InProcessSyncLocks:
-    """Bounded striped locks. Serialises within one process only."""
-
-    def __init__(self, stripes: int = 64) -> None:
-        self._locks = [threading.Lock() for _ in range(stripes)]
-
-    @contextmanager
-    def hold(self, tenant_id: str, crm_account_id: str) -> Iterator[LockHandle]:
-        lock = self._locks[advisory_lock_key(tenant_id, crm_account_id) % len(self._locks)]
-        with lock:
-            yield _AlwaysHeld()
 
 
 class PostgresAdvisorySyncLocks:

@@ -16,7 +16,6 @@ from jwt.algorithms import RSAAlgorithm
 
 from app.auth.tokens import JWKSCache, TokenVerifier
 from app.core.config import OIDCSettings
-from app.repositories.tenants import InMemoryTenantRepository, Tenant, TenantIntegration
 
 ISSUER = "https://idp.test"
 AUDIENCE = "integrationlab-api"
@@ -75,22 +74,3 @@ class TestIdP:
 
     def headers(self, role: str = "operator", tenant: str = "meridian", **kw) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token(tenant=tenant, roles=[role], **kw)}"}
-
-
-def test_tenants() -> InMemoryTenantRepository:
-    """meridian + harbor (active), suspended-co (suspended)."""
-    repo = InMemoryTenantRepository()
-    repo.put_tenant(Tenant("meridian", "Meridian Capital", "active"))
-    repo.put_tenant(Tenant("harbor", "Harborview Trust", "active"))
-    repo.put_tenant(Tenant("suspended-co", "Suspended Co", "suspended"))
-    for t in ("meridian", "harbor"):
-        up = t.upper()
-        repo.put_integration(TenantIntegration(
-            tenant_id=t, crm_base_url=f"http://crm-{t}.test", crm_token_url=f"http://crm-{t}.test/oauth/token",
-            crm_client_id=f"{t}-client", crm_client_secret_ref=f"env:IL_{up}__CRM_CLIENT_SECRET",
-            cms_base_url=f"http://cms-{t}.test", cms_api_key_ref=f"env:IL_{up}__CMS_API_KEY",
-            webhook_secret_ref=f"env:IL_{up}__WEBHOOK_SECRET"))
-    return repo
-
-
-test_tenants.__test__ = False  # type: ignore[attr-defined]

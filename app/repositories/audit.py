@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -19,7 +18,7 @@ from sqlalchemy import Connection, Engine, insert, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.db.models import AuditLogRow
-from app.repositories.sync_history import _translate
+from app.db.errors import translate_db_error
 
 audit_logger = logging.getLogger("integrationlab.audit")
 _DETAIL_KEYS_FORBIDDEN = ("secret", "token", "password", "authorization", "signature", "api_key")
@@ -62,22 +61,6 @@ class AuditRepository(Protocol):
     def list_recent(self, tenant_id: str, *, limit: int = 100, action: str | None = None) -> list[AuditEntry]: ...
 
 
-class InMemoryAuditRepository:
-    def __init__(self) -> None:
-        self.entries: list[AuditEntry] = []
-        self._lock = threading.Lock()
-
-    def record(self, entry: AuditEntry) -> None:
-        stamped = AuditEntry(**{**asdict(entry), "occurred_at": entry.occurred_at or datetime.now(timezone.utc)})
-        with self._lock:
-            self.entries.append(stamped)
-        emit_log(stamped)
-
-    def list_recent(self, tenant_id: str, *, limit: int = 100, action: str | None = None) -> list[AuditEntry]:
-        rows = [e for e in reversed(self.entries) if e.tenant_id == tenant_id and (not action or e.action == action)]
-        return rows[: max(1, min(limit, 500))]
-
-
 class PostgresAuditRepository:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
@@ -87,7 +70,7 @@ class PostgresAuditRepository:
             with self._engine.begin() as conn:
                 insert_audit(conn, entry)
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
         emit_log(entry)
 
     def list_recent(self, tenant_id: str, *, limit: int = 100, action: str | None = None) -> list[AuditEntry]:
@@ -99,7 +82,7 @@ class PostgresAuditRepository:
             with self._engine.connect() as conn:
                 rows = conn.execute(stmt).all()
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
         return [AuditEntry(actor=r.actor, action=r.action, outcome=r.outcome, tenant_id=r.tenant_id,
                            actor_client_id=r.actor_client_id, target_type=r.target_type, target_id=r.target_id,
                            details=r.details, occurred_at=r.occurred_at) for r in rows]

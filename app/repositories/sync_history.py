@@ -8,16 +8,14 @@ database; PostgresSyncHistoryRepository is the durable one. Every read requires 
 
 from __future__ import annotations
 
-import threading
-from collections import deque
 from typing import Protocol
 from uuid import UUID
 
 from sqlalchemy import Engine, select
-from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
-from sqlalchemy.exc import TimeoutError as PoolTimeout
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
+from app.db.errors import translate_db_error
 from app.db.models import ERROR_MESSAGE_MAX, SyncRecordRow
 from app.schemas.sync import SyncErrorDetail, SyncRecord, SyncStage, SyncStatus
 
@@ -37,66 +35,9 @@ class SyncHistoryRepository(Protocol):
     ) -> list[SyncRecord]: ...
 
 
-class InMemorySyncHistoryRepository:
-    """Thread-safe, bounded, process-local. Not durable: lost on restart."""
-
-    def __init__(self, max_records: int = 10_000) -> None:
-        self._records: deque[SyncRecord] = deque(maxlen=max_records)
-        self._lock = threading.Lock()
-
-    def add(self, record: SyncRecord) -> None:
-        with self._lock:
-            self._records.append(record)
-
-    def get(self, tenant_id: str, record_id: UUID) -> SyncRecord | None:
-        with self._lock:
-            return next(
-                (r for r in self._records if r.id == record_id and r.tenant_id == tenant_id), None
-            )
-
-    def list_recent(
-        self,
-        tenant_id: str,
-        *,
-        limit: int = 50,
-        crm_account_id: str | None = None,
-        status: SyncStatus | None = None,
-    ) -> list[SyncRecord]:
-        limit = max(1, min(limit, 500))
-        out: list[SyncRecord] = []
-        with self._lock:
-            for r in reversed(self._records):
-                if r.tenant_id != tenant_id:
-                    continue
-                if crm_account_id is not None and r.crm_account_id != crm_account_id:
-                    continue
-                if status is not None and r.status is not status:
-                    continue
-                out.append(r)
-                if len(out) >= limit:
-                    break
-        return out
-
-
 # --------------------------------------------------------------------------- #
 # PostgreSQL
 # --------------------------------------------------------------------------- #
-class RepositoryError(RuntimeError):
-    """Sync history could not be read or written."""
-
-
-class RepositoryUnavailableError(RepositoryError):
-    """The database could not be reached (transient)."""
-
-
-def _translate(exc: Exception) -> RepositoryError:
-    if isinstance(exc, (OperationalError, PoolTimeout)) or (
-        isinstance(exc, DBAPIError) and exc.connection_invalidated
-    ):
-        return RepositoryUnavailableError(f"database unavailable: {type(exc).__name__}")
-    return RepositoryError(f"database error: {type(exc).__name__}")
-
-
 class PostgresSyncHistoryRepository:
     """Durable sync history. Each call runs in its own short transaction."""
 
@@ -111,7 +52,7 @@ class PostgresSyncHistoryRepository:
             with self._sessions.begin() as session:
                 session.add(row)
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
 
     def get(self, tenant_id: str, record_id: UUID) -> SyncRecord | None:
         stmt = select(SyncRecordRow).where(
@@ -120,7 +61,7 @@ class PostgresSyncHistoryRepository:
             with self._sessions() as session:
                 row = session.scalars(stmt).one_or_none()
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
         return _from_row(row) if row else None
 
     def list_recent(
@@ -141,7 +82,7 @@ class PostgresSyncHistoryRepository:
             with self._sessions() as session:
                 rows = session.scalars(stmt).all()
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
         return [_from_row(r) for r in rows]
 
 

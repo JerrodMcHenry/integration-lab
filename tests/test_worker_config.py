@@ -17,7 +17,7 @@ def with_worker(**kw):
 
 def test_default_lease_covers_worst_case_with_margin():
     s = load_settings()
-    from app.api.deps import worst_case_sync_seconds
+    from app.core.config import worst_case_sync_seconds
     needed = worst_case_sync_seconds(s.crm, s.internal) + s.database.lock_timeout_seconds
     assert resolve_lease_seconds(s) >= 2 * needed
 

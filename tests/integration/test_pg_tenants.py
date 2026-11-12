@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import threading
 import uuid
 
 import pytest
@@ -13,33 +12,19 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
 from app.repositories.sync_history import PostgresSyncHistoryRepository
-from app.repositories.tenants import (
-    MappingVersionConflict,
-    PostgresTenantRepository,
-    Tenant,
-    TenantIntegration,
-    seed_postgres,
-)
+from app.repositories.tenants import MappingVersionConflict, PostgresTenantRepository, Tenant, seed_postgres
 from app.schemas.sync import SyncStatus
 from app.seed import load_seed
 from app.services.account_sync import AccountSyncService
 from app.services.locks import PostgresAdvisorySyncLocks
 from app.services.secrets import EnvSecretResolver
 from app.services.tenant_context import DbMappingProvider, TenantConnectionProvider
-from tests.conftest import cms_settings, crm_settings
-from tests.integration.conftest import ROOT
-from tests.test_api_security import HARBOR_MAPPING, MAPPING
-from tests.test_tenant_isolation import SECRETS, World
-
-
-def integration(tenant: str, **overrides) -> TenantIntegration:
-    up = tenant.upper()
-    values = dict(tenant_id=tenant, crm_base_url=f"http://crm-{tenant}.test",
-                  crm_token_url=f"http://crm-{tenant}.test/oauth/token", crm_client_id=f"{tenant}-client",
-                  crm_client_secret_ref=f"env:IL_{up}__CRM_CLIENT_SECRET", cms_base_url=f"http://cms-{tenant}.test",
-                  cms_api_key_ref=f"env:IL_{up}__CMS_API_KEY")
-    values.update(overrides)
-    return TenantIntegration(**values)
+from tests.support.clients import cms_settings, crm_settings
+from tests.support.data import ROOT
+from tests.support.data import HARBOR_MAPPING, MAPPING
+from tests.support.data import CONNECTION_SECRETS
+from tests.support.tenants import World, integration
+from tests.support.concurrency import join_all, start_threads
 
 
 @pytest.fixture
@@ -84,9 +69,6 @@ def test_concurrent_mapping_publish_conflicts_instead_of_overwriting(repo, pg_en
     repo.add_mapping_version("meridian", MAPPING, "seed")  # v1 committed
     conn = pg_engine.connect()
     txn = conn.begin()
-    conn.execute(text("INSERT INTO tenant_mapping_configs (tenant_id, version, config, created_by) "
-                      "VALUES ('meridian', 2, CAST(:c AS jsonb), 'writer-a')"),
-                 {"c": __import__("json").dumps({**MAPPING, "version": 2})})
     result: dict = {}
 
     def writer_b():
@@ -95,13 +77,21 @@ def test_concurrent_mapping_publish_conflicts_instead_of_overwriting(repo, pg_en
         except Exception as exc:  # noqa: BLE001
             result["err"] = exc
 
-    t = threading.Thread(target=writer_b)
-    t.start()
-    t.join(0.5)            # B is blocked on A's uncommitted v2
-    assert t.is_alive()
-    txn.commit()
-    conn.close()
-    t.join(5)
+    threads = []
+    try:
+        conn.execute(text("INSERT INTO tenant_mapping_configs (tenant_id, version, config, created_by) "
+                          "VALUES ('meridian', 2, CAST(:c AS jsonb), 'writer-a')"),
+                     {"c": __import__("json").dumps({**MAPPING, "version": 2})})
+        threads = start_threads([writer_b], name="writer-b")
+        threads[0].join(0.5)   # intentional probe: B must still be blocked on A's uncommitted v2
+        assert threads[0].is_alive(), "writer B was not blocked by writer A's uncommitted row"
+        txn.commit()
+    finally:
+        # Never leak A's transaction: it would block the next test's TRUNCATE.
+        if txn.is_active:
+            txn.rollback()
+        conn.close()
+        join_all(threads, timeout=10, what="writer B to finish after writer A committed")
     assert isinstance(result.get("err"), MappingVersionConflict)
     assert [v.created_by for v in repo.list_mapping_versions("meridian")] == ["writer-a", "seed"]
 
@@ -129,7 +119,7 @@ def test_tenant_constraints(pg_engine, sql, constraint):
 
 
 def test_tenant_with_history_cannot_be_deleted(pg_engine):
-    from tests.integration.test_pg_history import rec
+    from tests.support.db import rec
     PostgresSyncHistoryRepository(pg_engine).add(rec())
     with pytest.raises(IntegrityError, match="fk_sync_records_tenant_id"), pg_engine.begin() as c:
         c.execute(text("DELETE FROM tenants WHERE id = 'meridian'"))
@@ -156,7 +146,7 @@ def test_two_tenants_end_to_end_with_postgres(pg_engine, repo):
     world = World()  # in-process CRM/CMS per tenant
     history = PostgresSyncHistoryRepository(pg_engine)
     service = AccountSyncService(
-        connections=TenantConnectionProvider(repo, EnvSecretResolver(SECRETS, app_env="test"),
+        connections=TenantConnectionProvider(repo, EnvSecretResolver(CONNECTION_SECRETS, app_env="test"),
                                              crm_defaults=crm_settings(), cms_defaults=cms_settings(),
                                              http_client_factory=world.route),
         mappings=DbMappingProvider(repo), history=history,

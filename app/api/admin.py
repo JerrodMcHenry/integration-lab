@@ -12,8 +12,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
-from app.api.deps import get_audit_repository, get_tenant_repository
-from app.auth.dependencies import get_principal, require, require_audited
+from app.api.dependencies import get_audit_repository, get_principal, get_tenant_repository, require
 from app.auth.permissions import Permission
 from app.auth.tokens import Principal
 from app.mapping.mapper import FieldMapper, MappingConfigError
@@ -109,8 +108,8 @@ def mapping_versions(principal: Annotated[Principal, Depends(require(Permission.
             summary="Publish a new mapping version (requires config:write)",
             responses={409: {"description": "Concurrent publish; retry"},
                        422: {"description": "Invalid mapping, or tenant_id doesn't match the caller"}})
-def publish_mapping(principal: Annotated[Principal, Depends(require_audited(Permission.CONFIG_WRITE,
-                                                                          "mapping.publish"))],
+def publish_mapping(principal: Annotated[Principal, Depends(require(Permission.CONFIG_WRITE,
+                                                                  audit_action="mapping.publish"))],
                     repo: Annotated[TenantRepository, Depends(get_tenant_repository)],
                     audit: Annotated[AuditRepository, Depends(get_audit_repository)],
                     config: Annotated[dict[str, Any], Body(max_length=100)]):

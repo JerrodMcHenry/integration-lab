@@ -18,24 +18,14 @@ from app.services.locks import (
     advisory_lock_key,
 )
 from tests.integration import _workers
-from tests.integration.conftest import db_settings
+from tests.support.db import db_settings, try_lock_elsewhere
+from tests.support.concurrency import join_all, pool_results, start_threads, wait_event, wait_until
 
 T = "meridian"
 
 
 def locks(engine, timeout=5.0):
     return PostgresAdvisorySyncLocks(engine, lock_timeout_seconds=timeout)
-
-
-def try_lock_elsewhere(url: str, tenant: str, account: str) -> bool:
-    """Probe from an independent engine: can someone else take this lock right now?"""
-    engine = build_engine(db_settings(url), application_name="probe")
-    try:
-        with engine.begin() as conn:
-            return conn.execute(text("SELECT pg_try_advisory_xact_lock(:k)"),
-                                {"k": advisory_lock_key(tenant, account)}).scalar()
-    finally:
-        engine.dispose()
 
 
 def advisory_locks_held(engine, key: int) -> int:
@@ -89,14 +79,15 @@ def test_second_holder_waits_then_proceeds(pg_engine):
             time.sleep(0.4)
             events.append("first-out")
 
-    t = threading.Thread(target=first)
-    t.start()
-    inside.wait(5)
-    started = time.monotonic()
-    with provider.hold(T, "SF-1"):
-        events.append("second-in")
-        waited = time.monotonic() - started
-    t.join()
+    threads = start_threads([first], name="first-holder")
+    try:
+        wait_event(inside, timeout=5, what="first holder to acquire the lock")
+        started = time.monotonic()
+        with provider.hold(T, "SF-1"):
+            events.append("second-in")
+            waited = time.monotonic() - started
+    finally:
+        join_all(threads, timeout=15, what="first lock holder to finish")
     assert events == ["first-in", "first-out", "second-in"]
     assert waited >= 0.25
 
@@ -109,18 +100,17 @@ def test_lock_timeout(pg_engine):
             holder_in.set()
             release.wait(10)
 
-    t = threading.Thread(target=holder)
-    t.start()
-    holder_in.wait(5)
-    started = time.monotonic()
+    threads = start_threads([holder], name="holder")
     try:
+        wait_event(holder_in, timeout=5, what="holder to acquire the lock")
+        started = time.monotonic()
         with pytest.raises(LockTimeoutError) as exc_info:
             with locks(pg_engine, timeout=0.3).hold(T, "SF-1"):
                 pass
         elapsed = time.monotonic() - started
     finally:
         release.set()
-        t.join()
+        join_all(threads, timeout=15, what="lock holder to release")
     assert exc_info.value.retryable and exc_info.value.code == "sync_lock_timeout"
     assert 0.25 <= elapsed < 2.0
 
@@ -138,20 +128,19 @@ def test_lock_released_when_holder_connection_dies(pg_engine, pg_url):
         except Exception:  # noqa: BLE001 - connection is gone; expected
             pass
 
-    t = threading.Thread(target=holder)
-    t.start()
-    holder_in.wait(5)
-    assert try_lock_elsewhere(pg_url, T, "SF-1") is False
-    with pg_engine.begin() as conn:
-        conn.execute(text("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                          "WHERE application_name = 'crashing-holder'"))
-    deadline = time.time() + 5
-    while not try_lock_elsewhere(pg_url, T, "SF-1"):
-        assert time.time() < deadline, "lock not released after holder session died"
-        time.sleep(0.05)
-    done.set()
-    t.join()
-    crash_engine.dispose()
+    threads = start_threads([holder], name="crashing-holder")
+    try:
+        wait_event(holder_in, timeout=5, what="holder to acquire the lock")
+        assert try_lock_elsewhere(pg_url, T, "SF-1") is False
+        with pg_engine.begin() as conn:
+            conn.execute(text("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                              "WHERE application_name = 'crashing-holder'"))
+        wait_until(lambda: try_lock_elsewhere(pg_url, T, "SF-1"), timeout=5,
+                   what="lock to be released after the holder session died")
+    finally:
+        done.set()
+        join_all(threads, timeout=15, what="crashed holder thread to exit")
+        crash_engine.dispose()
 
 
 def test_database_unavailable_fails_closed(dead_engine):
@@ -168,7 +157,7 @@ def _run_lock_workers(pg_url, tmp_path, accounts, hold=0.3):
         pending = [pool.apply_async(_workers.hold_lock, (pg_url, T, a, hold, barrier)) for a in accounts]
         time.sleep(1.5)  # let every process start and reach the barrier
         open(barrier, "w").close()
-        return [p.get(timeout=60) for p in pending]
+        return pool_results(pending, timeout=60, what=f"{len(accounts)} lock-holding processes")
 
 
 def test_mutual_exclusion_across_processes(pg_url, pg_engine, tmp_path):
@@ -255,15 +244,14 @@ def test_lock_timeout_leaves_connection_clean(pg_engine):
             holder_in.set()
             release.wait(10)
 
-    t = threading.Thread(target=holder)
-    t.start()
-    holder_in.wait(5)
+    threads = start_threads([holder], name="holder")
     try:
+        wait_event(holder_in, timeout=5, what="holder to acquire the lock")
         with pytest.raises(LockTimeoutError):
             with locks(pg_engine, timeout=0.2).hold(T, "SF-1"):
                 pass
     finally:
         release.set()
-        t.join()
+        join_all(threads, timeout=15, what="lock holder to release")
     with pg_engine.connect() as c:
         assert c.exec_driver_sql("SHOW lock_timeout").scalar() == "0"

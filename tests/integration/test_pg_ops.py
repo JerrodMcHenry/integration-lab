@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import dataclasses
 import uuid
 
@@ -12,27 +11,27 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from app import retention
-from app.api import deps as api_deps
-from app.api.webhooks import _events_repo
-from app.auth import dependencies as auth_deps
+from app.api import dependencies as deps
 from app.core.config import RetentionSettings
 from app.main import app
 from app.repositories.audit import PostgresAuditRepository
+from app.repositories.operations import PostgresOperationsRepository
 from app.repositories.webhook_events import PostgresWebhookEventRepository
-from tests.integration.test_pg_retries import attempts, crm_fault, drain, fast_policy
-from tests.integration.test_pg_worker import by_id, service, world  # noqa: F401 (fixtures)
-from tests.integration.webhook_helpers import build_worker, event_body, ingest_direct, ingestor, signed
+from tests.support.webhooks import attempts, crm_fault, drain, fast_policy
+from tests.support.webhooks import by_id
+from tests.support.webhooks import build_worker, event_body, ingest_direct, ingestor, signed
+from tests.support.concurrency import run_in_threads
 
 
 @pytest.fixture
 def api(pg_engine, auth, world):
     audit = PostgresAuditRepository(pg_engine)
-    app.dependency_overrides[_events_repo] = lambda: PostgresWebhookEventRepository(pg_engine)
-    app.dependency_overrides[auth_deps.get_audit_repository] = lambda: audit
-    app.dependency_overrides[api_deps.get_audit_repository] = lambda: audit
+    app.dependency_overrides[deps.get_event_repository] = lambda: PostgresWebhookEventRepository(pg_engine)
+    app.dependency_overrides[deps.get_operations_repository] = lambda: PostgresOperationsRepository(pg_engine)
+    app.dependency_overrides[deps.get_audit_repository] = lambda: audit
     with TestClient(app) as tc:
         yield tc
-    for dep in (_events_repo, auth_deps.get_audit_repository, api_deps.get_audit_repository):
+    for dep in (deps.get_event_repository, deps.get_operations_repository, deps.get_audit_repository):
         app.dependency_overrides.pop(dep, None)
 
 
@@ -112,8 +111,8 @@ def test_non_replayable_states_conflict_and_are_audited(api, auth, pg_engine, wo
 def test_concurrent_replays_only_one_wins(api, auth, pg_engine, world, service):
     eid = dead_letter_event(pg_engine, world, service)
     h = auth.headers("operator")
-    with concurrent.futures.ThreadPoolExecutor(6) as pool:
-        codes = sorted(pool.map(lambda _: api.post(f"/webhooks/events/{eid}/replay", headers=h).status_code, range(6)))
+    codes = sorted(run_in_threads(lambda: api.post(f"/webhooks/events/{eid}/replay", headers=h).status_code,
+                                  count=6, timeout=60, what="6 concurrent replay requests"))
     assert codes == [202] + [409] * 5
     assert by_id(pg_engine)[eid]["replay_count"] == 1
 
@@ -251,16 +250,17 @@ def test_audit_endpoint_admin_only_and_tenant_scoped(api, auth, pg_engine, world
 
 def test_mapping_publish_is_audited(api, auth, pg_engine):
     import json
-    from tests.test_api_security import MAPPING
+    from tests.support.data import MAPPING
     from app.repositories.tenants import PostgresTenantRepository
-    app.dependency_overrides[api_deps.get_tenant_repository] = lambda: PostgresTenantRepository(pg_engine)
+    previous = app.dependency_overrides.get(deps.get_tenant_repository)
+    app.dependency_overrides[deps.get_tenant_repository] = lambda: PostgresTenantRepository(pg_engine)
     try:
         assert api.put("/admin/mapping", json=MAPPING, headers=auth.headers("admin", sub="adm")).status_code == 201
         assert api.put("/admin/mapping", json={**MAPPING, "tenant_id": "harbor"},
                        headers=auth.headers("admin", sub="adm")).status_code == 422
         assert api.put("/admin/mapping", json=MAPPING, headers=auth.headers("operator", sub="op")).status_code == 403
     finally:
-        app.dependency_overrides[api_deps.get_tenant_repository] = lambda: auth_deps.get_tenant_repository()
+        app.dependency_overrides[deps.get_tenant_repository] = previous  # restore the auth fixture's directory
     rows = audit_rows(pg_engine, "mapping.publish")
     assert [(r["actor"], r["outcome"]) for r in rows] == [("adm", "success"), ("adm", "rejected"), ("op", "denied")]
     assert "fields" in rows[0]["details"] and json.dumps(rows) .count("secret") == 0
@@ -346,10 +346,19 @@ def test_retention_execute_deletes_only_eligible_and_audits(pg_engine, world, se
 # Database outages on the ops API
 # --------------------------------------------------------------------------- #
 def test_ops_endpoints_return_503_when_database_down(api, auth, dead_engine):
-    app.dependency_overrides[_events_repo] = lambda: PostgresWebhookEventRepository(dead_engine)
+    app.dependency_overrides[deps.get_event_repository] = lambda: PostgresWebhookEventRepository(dead_engine)
+    app.dependency_overrides[deps.get_operations_repository] = lambda: PostgresOperationsRepository(dead_engine)
     dead_audit = PostgresAuditRepository(dead_engine)
-    app.dependency_overrides[api_deps.get_audit_repository] = lambda: dead_audit
+    app.dependency_overrides[deps.get_audit_repository] = lambda: dead_audit
     assert api.post(f"/webhooks/events/{uuid.uuid4()}/replay", headers=auth.headers("operator")).status_code == 503
     assert api.post("/webhooks/events/replay", json={}, headers=auth.headers("operator")).status_code == 503
     assert api.get("/ops/metrics", headers=auth.headers("viewer")).status_code == 503
     assert api.get("/admin/audit", headers=auth.headers("admin")).status_code == 503
+
+
+def test_unhandled_database_errors_use_accurate_generic_messages(api, auth, dead_engine):
+    """Routes without their own handling fall back to app-wide messages that don't name the wrong store."""
+    app.dependency_overrides[deps.get_event_repository] = lambda: PostgresWebhookEventRepository(dead_engine)
+    r = api.get("/webhooks/events", headers=auth.headers("viewer"))
+    assert r.status_code == 503 and r.json() == {"detail": "database unavailable; retry later"}
+    assert "history" not in r.text.lower()

@@ -103,7 +103,7 @@ by an HMAC over its **raw body** with the tenant's webhook secret:
 |---|:-:|:-:|:-:|---|
 | `tenant:read` | ✅ | ✅ | ✅ | `GET /tenant` |
 | `history:read` | ✅ | ✅ | ✅ | `GET /sync/history`, `GET /sync/history/{id}`, `GET /webhooks/events[/{id}[/attempts]]`, `GET /ops/metrics` |
-| `sync:run` | | ✅ | ✅ | `POST /sync/accounts/{id}`, `POST /accounts` (legacy), `POST /webhooks/events/{id}/replay`, `POST /webhooks/events/replay` |
+| `sync:run` | | ✅ | ✅ | `POST /sync/accounts/{id}`, `POST /webhooks/events/{id}/replay`, `POST /webhooks/events/replay` |
 | `config:read` | | | ✅ | `GET /admin/integration`, `GET /admin/mapping`, `GET /admin/mapping/versions`, `GET /admin/audit` |
 | `config:write` | | | ✅ | `PUT /admin/mapping` |
 | (authenticated) | ✅ | ✅ | ✅ | `GET /me` |
@@ -145,7 +145,7 @@ the old logic (verified).
 | Control | Where | Evidence |
 |---|---|---|
 | OAuth 2.0 client credentials to each tenant's CRM, with a per-tenant token cache | `crm_client.py`, `tenant_context.py` | `test_crm_contract.py`, `test_tenant_isolation.py` |
-| Production refuses: dev-default secrets, `dev-only*` tenant secrets, non-HTTPS upstreams, non-HTTPS OIDC issuer/JWKS, the mock IdP issuer, a missing `DATABASE_URL` | `config.py`, `secrets.py` | `test_production_safety.py` |
+| Production refuses: `dev-only*` tenant secrets, non-HTTPS tenant CRM/CMS endpoints, non-HTTPS OIDC issuer/JWKS, the mock IdP issuer, a missing `DATABASE_URL` | `config.py`, `secrets.py` | `test_production_safety.py` |
 | OpenAPI and interactive docs not served in production | `app/main.py` | `test_docs_disabled_in_production` |
 | Mock `/_admin` routes never mounted in production/staging; forcing them raises | `mock_common/guard.py` | HTTP-probe tests in `test_production_safety.py` |
 | Mock IdP refuses to start in production/staging | `mock_idp/main.py` | `test_mock_idp_refuses_to_start_in_production_like_envs` |

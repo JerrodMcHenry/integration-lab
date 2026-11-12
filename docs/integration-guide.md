@@ -7,21 +7,22 @@ and calls its REST API with a bearer token.
 
 ### Configuration
 
+Connection details are **per tenant** (`tenant_integrations`: CRM base URL, token
+URL, client id and a *reference* to the client secret). Environment variables
+set only the platform-wide HTTP policy:
+
 | Variable | Default | Notes |
 |---|---|---|
-| `CRM_BASE_URL` | `http://127.0.0.1:8001` | CRM REST base URL |
-| `CRM_TOKEN_URL` | `${CRM_BASE_URL}/oauth/token` | Token endpoint |
-| `CRM_CLIENT_ID` | `integrationlab-dev` | Dev default only |
-| `CRM_CLIENT_SECRET` | `dev-only-secret` | Dev default only. Must be overridden outside local dev |
 | `CRM_TIMEOUT_SECONDS` | `5` | Per-request timeout (connect + read) |
 | `CRM_MAX_RETRIES` | `2` | Retries for transient read failures, 0–5 |
 | `CRM_BACKOFF_BASE_SECONDS` | `0.5` | First backoff ceiling, doubles per attempt |
 | `CRM_BACKOFF_MAX_SECONDS` | `4` | Backoff cap |
 
-Since M5, **each tenant has its own CRM connection** in `tenant_integrations`
-(URL, token URL, client id, and a *reference* to the client secret). The
-`CRM_*` variables above now provide only the timeout/retry policy for every tenant,
-plus the credentials for the single-tenant fallback.
+In production every tenant endpoint (CRM base URL, token URL, CMS base URL) must
+be `https://`; a non-HTTPS endpoint fails the sync with `tenant_connection_invalid`.
+The global `CRM_BASE_URL`, `CRM_TOKEN_URL`, `CRM_CLIENT_ID`, `CRM_CLIENT_SECRET`,
+`INTERNAL_API_BASE_URL` and `INTERNAL_API_KEY` variables were removed in Phase 3;
+if present they are ignored.
 
 ### Onboarding a tenant (operator task)
 
@@ -59,8 +60,6 @@ plus the credentials for the single-tenant fallback.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `INTERNAL_API_BASE_URL` | `http://127.0.0.1:8002` | |
-| `INTERNAL_API_KEY` | `dev-only-internal-key` | Bearer API key. Dev default, rejected in production |
 | `INTERNAL_API_TIMEOUT_SECONDS` | `5` | |
 | `INTERNAL_API_MAX_RETRIES` | `2` | 0–5. Applies to GET, PATCH and idempotency-keyed POST |
 | `INTERNAL_API_BACKOFF_BASE_SECONDS` / `_MAX_SECONDS` | `0.5` / `4` | |

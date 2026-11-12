@@ -20,7 +20,7 @@ from urllib.parse import quote
 
 import httpx
 
-from app.core.config import InternalSystemSettings, get_settings
+from app.core.config import InternalSystemSettings
 from app.integrations.errors import IntegrationError
 from app.integrations.retry import call_with_retry
 
@@ -71,12 +71,12 @@ class InternalUnavailableError(InternalSystemError):
 class InternalSystemClient:
     def __init__(
         self,
-        settings: InternalSystemSettings | None = None,
+        settings: InternalSystemSettings,
         *,
         http_client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        self._settings = settings or get_settings().internal
+        self._settings = settings
         self._owns_http_client = http_client is None
         self._http = http_client or httpx.Client(timeout=self._settings.timeout_seconds)
         self._sleep = sleep

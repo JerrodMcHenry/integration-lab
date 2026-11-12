@@ -10,18 +10,13 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from app.api.webhooks import _events_repo, get_webhook_ingestor
+from app.api.dependencies import get_event_repository, get_webhook_ingestor
 from app.main import app
 from app.repositories.webhook_events import PostgresWebhookEventRepository
 from mock_crm import main as mock_crm
-from tests.integration.webhook_helpers import (
-    ALL_SECRETS,
-    event_body,
-    events,
-    ingestor,
-    seed_tenants,
-    signed,
-)
+from tests.support.data import ALL_SECRETS
+from tests.support.webhooks import event_body, events, ingestor, seed_tenants, signed
+from tests.support.concurrency import run_in_threads
 
 M_SECRET, H_SECRET = "whsec_meridian_test", "whsec_harbor_test"
 
@@ -31,12 +26,12 @@ def api(pg_engine, auth):
     seed_tenants(pg_engine)
     holder = {"ing": ingestor(pg_engine)}
     app.dependency_overrides[get_webhook_ingestor] = lambda: holder["ing"]
-    app.dependency_overrides[_events_repo] = lambda: PostgresWebhookEventRepository(pg_engine)
+    app.dependency_overrides[get_event_repository] = lambda: PostgresWebhookEventRepository(pg_engine)
     with TestClient(app) as tc:
         tc.holder = holder
         yield tc
     app.dependency_overrides.pop(get_webhook_ingestor, None)
-    app.dependency_overrides.pop(_events_repo, None)
+    app.dependency_overrides.pop(get_event_repository, None)
 
 
 def post(api, body, headers, tenant="meridian"):
@@ -198,10 +193,9 @@ def test_idempotency_is_tenant_scoped(api, pg_engine):
 
 
 def test_concurrent_duplicate_deliveries_create_one_row(api, pg_engine):
-    import concurrent.futures
     body = event_body(event_id="evt_race")
-    with concurrent.futures.ThreadPoolExecutor(8) as pool:
-        codes = sorted(pool.map(lambda _: post(api, body, signed(body)).status_code, range(8)))
+    codes = sorted(run_in_threads(lambda: post(api, body, signed(body)).status_code,
+                                  count=8, timeout=60, what="8 concurrent duplicate deliveries"))
     assert codes == [200] * 7 + [202]
     assert len(events(pg_engine)) == 1
 

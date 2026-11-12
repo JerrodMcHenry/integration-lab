@@ -76,17 +76,13 @@ def test_production_env_var_disables_admin(module, monkeypatch):
 # --- IntegrationLab settings ---------------------------------------------- #
 PROD_OK = {
     "APP_ENV": "production",
-    "CRM_BASE_URL": "https://crm.example.com",
-    "CRM_CLIENT_SECRET": "a-real-secret-from-a-vault",
-    "INTERNAL_API_BASE_URL": "https://cms.example.com",
-    "INTERNAL_API_KEY": "a-real-key-from-a-vault",
     "DATABASE_URL": "postgresql+psycopg://app@db.example.com/integrationlab",
     "OIDC_ISSUER": "https://login.example.com/realms/integrationlab",
 }
 
 
 def _apply(monkeypatch, env):
-    for k in ("CRM_TOKEN_URL", "OIDC_JWKS_URL", *PROD_OK):
+    for k in ("OIDC_JWKS_URL", *PROD_OK):
         monkeypatch.delenv(k, raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -97,12 +93,18 @@ def test_production_settings_with_real_values_load(monkeypatch):
     assert load_settings().is_production
 
 
+def test_obsolete_global_crm_cms_variables_are_ignored(monkeypatch):
+    """Since M5 every connection is per tenant; global CRM/CMS credentials no longer exist (Phase 3)."""
+    _apply(monkeypatch, {**PROD_OK, "CRM_CLIENT_SECRET": "dev-only-secret", "INTERNAL_API_KEY": "dev-only-key",
+                         "CRM_BASE_URL": "http://insecure.example.com"})
+    settings = load_settings()  # dev-looking legacy values neither required nor rejected
+    for name in ("base_url", "token_url", "client_id", "client_secret", "api_key"):
+        assert not hasattr(settings.crm, name) and not hasattr(settings.internal, name)
+
+
 @pytest.mark.parametrize(
     "override, message",
     [
-        ({"CRM_CLIENT_SECRET": "dev-only-secret"}, "CRM_CLIENT_SECRET"),
-        ({"INTERNAL_API_KEY": "dev-only-internal-key"}, "INTERNAL_API_KEY"),
-        ({"CRM_BASE_URL": "http://crm.example.com"}, "https"),
         ({"OIDC_ISSUER": "http://login.example.com"}, "OIDC_ISSUER must use https"),
         ({"OIDC_ISSUER": "http://localhost:8090"}, "development mock IdP"),
         ({"OIDC_JWKS_URL": "http://login.example.com/jwks"}, "OIDC_JWKS_URL must use https"),

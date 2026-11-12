@@ -8,8 +8,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
 
-from app.api.deps import get_sync_history, get_sync_service
-from app.auth.dependencies import require
+from app.api.dependencies import get_sync_history, get_sync_service, require
 from app.auth.permissions import Permission
 from app.auth.tokens import Principal
 from app.repositories.sync_history import SyncHistoryRepository

@@ -10,15 +10,14 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from app.api.deps import get_audit_repository
-from app.api.webhooks import _events_repo
-from app.auth.dependencies import require
+from app.api.dependencies import get_audit_repository, get_operations_repository, require
 from app.auth.permissions import Permission
 from app.auth.tokens import Principal
 from app.core.config import get_settings
 from app.repositories.audit import AuditRepository
-from app.repositories.sync_history import RepositoryUnavailableError
-from app.repositories.webhook_events import PostgresWebhookEventRepository
+from app.db.errors import RepositoryUnavailableError
+from app.repositories.operations import PostgresOperationsRepository
+from app.worker.runner import resolve_lease_seconds
 
 router = APIRouter(tags=["operations"])
 _ZERO = {"pending": 0, "ready": 0, "retry_backlog": 0, "processing": 0, "expired_leases": 0, "failed": 0,
@@ -27,7 +26,6 @@ _ZERO = {"pending": 0, "ready": 0, "retry_backlog": 0, "processing": 0, "expired
 
 
 def _stale_after() -> float:
-    from app.worker.runner import resolve_lease_seconds
     return resolve_lease_seconds(get_settings())
 
 
@@ -61,7 +59,7 @@ class OpsMetricsResponse(BaseModel):
 @router.get("/ops/metrics", response_model=OpsMetricsResponse,
             summary="Event queue metrics for the caller's tenant + worker health (requires history:read)")
 def ops_metrics(principal: Annotated[Principal, Depends(require(Permission.HISTORY_READ))],
-                repo: Annotated[PostgresWebhookEventRepository, Depends(_events_repo)]):
+                repo: Annotated[PostgresOperationsRepository, Depends(get_operations_repository)]):
     try:
         rows = repo.metrics(principal.tenant_id)
         workers = repo.workers(stale_after_seconds=_stale_after())
@@ -105,7 +103,7 @@ def audit_log(principal: Annotated[Principal, Depends(require(Permission.CONFIG_
 # Platform-wide Prometheus metrics (all tenants): separate static bearer token
 # --------------------------------------------------------------------------- #
 @router.get("/metrics", response_class=PlainTextResponse, include_in_schema=False)
-def prometheus(repo: Annotated[PostgresWebhookEventRepository, Depends(_events_repo)],
+def prometheus(repo: Annotated[PostgresOperationsRepository, Depends(get_operations_repository)],
                authorization: Annotated[str | None, Header()] = None):
     token = get_settings().metrics_token
     if not token:

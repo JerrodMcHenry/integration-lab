@@ -8,15 +8,16 @@ from contextlib import contextmanager
 import pytest
 
 from app.core.config import RetrySettings
-from app.mapping.mapper import MappingRegistry
+from tests.support.mappings import MappingRegistry
 from app.repositories.audit import AuditEntry
-from app.repositories.sync_history import InMemorySyncHistoryRepository
+from tests.support.fakes import InMemorySyncHistoryRepository
 from app.schemas.sync import SyncStatus
 from app.services.account_sync import AccountSyncService, OwnershipLost
 from app.services.locks import LockLostError
 from app.worker.retry_policy import RetryPolicy
 from app.worker.runner import EventWorker, WorkerConfigurationError
-from tests.conftest import MAPPING_DIR
+from tests.support.data import MAPPING_DIR
+from tests.support.fakes import StaticConnections
 
 
 def policy(base=5.0, cap=300.0, max_attempts=5, seed=1):
@@ -74,7 +75,7 @@ class Clock:
 
 
 def worker(clock, lease=60.0, margin=10.0):
-    return EventWorker(events=None, service=None, tenants=None, lease_seconds=lease, batch_size=1, max_attempts=5,
+    return EventWorker(events=None, operations=None, service=None, tenants=None, lease_seconds=lease, batch_size=1, max_attempts=5,
                        poll_interval=0.1, write_margin_seconds=margin, clock=clock)
 
 
@@ -109,7 +110,7 @@ class LostLock:
 
 
 @pytest.mark.parametrize("make_svc, code", [
-    (lambda crm, cms: AccountSyncService(crm=crm, destination=cms, mappings=MappingRegistry(MAPPING_DIR),
+    (lambda crm, cms: AccountSyncService(connections=StaticConnections(crm, cms), mappings=MappingRegistry(MAPPING_DIR),
                                          history=InMemorySyncHistoryRepository(), locks=LostLock()), "sync_lock_lost"),
 ])
 def test_lost_lock_blocks_destination_write(crm_client, cms_client, cms_app, make_svc, code):
@@ -127,7 +128,7 @@ def test_guard_blocks_destination_write(sync_service, cms_app):
 
 
 def test_guard_checked_before_update_too(sync_service, cms_app, crm_app):
-    from tests.conftest import crm_patch
+    from tests.support.clients import crm_patch
     sync_service.sync_account("meridian", "SF-1001")
     crm_patch(crm_app, "SF-1001", Name="Changed")
     writes = cms_app.app.state.cms.write_count

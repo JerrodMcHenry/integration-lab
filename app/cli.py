@@ -14,7 +14,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from app.core.config import get_settings
+from app.core.config import ConfigurationError, get_settings
 from app.db.engine import build_engine
 from app.mapping.mapper import FieldMapper
 from app.repositories.tenants import seed_postgres
@@ -25,9 +25,6 @@ def seed_dev(path: Path) -> int:
     settings = get_settings()
     if settings.is_production:
         print("refusing to seed development tenants in a production environment", file=sys.stderr)
-        return 2
-    if not settings.database.url:
-        print("DATABASE_URL is not set", file=sys.stderr)
         return 2
     engine = build_engine(settings.database, application_name="integrationlab-cli")
     try:
@@ -48,9 +45,6 @@ def retention(execute_flag: bool) -> int:
     from app import retention as ret
 
     settings = get_settings()
-    if not settings.database.url:
-        print("DATABASE_URL is not set", file=sys.stderr)
-        return 2
     engine = build_engine(settings.database, application_name="integrationlab-retention")
     try:
         policy = settings.retention
@@ -83,6 +77,11 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("--execute", action="store_true",
                     help="actually delete (also requires RETENTION_ENABLED=true)")
     args = parser.parse_args(argv)
+    try:
+        get_settings()
+    except ConfigurationError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
     if args.command == "seed-dev":
         return seed_dev(args.file)
     if args.command == "retention":

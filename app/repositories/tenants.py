@@ -6,10 +6,8 @@ method that lists or returns another tenant's integration or mapping data.
 
 from __future__ import annotations
 
-import copy
-import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Protocol
 
 from sqlalchemy import Engine, func, insert, select
@@ -18,7 +16,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from app.db.models import TenantIntegrationRow, TenantMappingConfigRow, TenantRow
-from app.repositories.sync_history import RepositoryError, _translate
+from app.db.errors import RepositoryError, translate_db_error
 
 
 @dataclass(frozen=True)
@@ -69,43 +67,6 @@ class TenantRepository(Protocol):
 # --------------------------------------------------------------------------- #
 # In-memory
 # --------------------------------------------------------------------------- #
-class InMemoryTenantRepository:
-    def __init__(self) -> None:
-        self._tenants: dict[str, Tenant] = {}
-        self._integrations: dict[str, TenantIntegration] = {}
-        self._mappings: dict[str, list[MappingVersion]] = {}
-        self._lock = threading.Lock()
-
-    # seeding helpers (not part of the protocol)
-    def put_tenant(self, tenant: Tenant) -> None:
-        self._tenants[tenant.id] = tenant
-
-    def put_integration(self, integration: TenantIntegration) -> None:
-        self._integrations[integration.tenant_id] = integration
-
-    def get_tenant(self, tenant_id: str) -> Tenant | None:
-        return self._tenants.get(tenant_id)
-
-    def get_integration(self, tenant_id: str) -> TenantIntegration | None:
-        return self._integrations.get(tenant_id)
-
-    def get_active_mapping(self, tenant_id: str) -> MappingVersion | None:
-        versions = self._mappings.get(tenant_id)
-        return copy.deepcopy(versions[-1]) if versions else None
-
-    def list_mapping_versions(self, tenant_id: str) -> list[MappingVersion]:
-        return copy.deepcopy(list(reversed(self._mappings.get(tenant_id, []))))
-
-    def add_mapping_version(self, tenant_id: str, config: dict[str, Any], created_by: str) -> MappingVersion:
-        with self._lock:
-            if tenant_id not in self._tenants:
-                raise RepositoryError("unknown tenant")
-            versions = self._mappings.setdefault(tenant_id, [])
-            version = (versions[-1].version if versions else 0) + 1
-            stored = MappingVersion(tenant_id, version, {**copy.deepcopy(config), "version": version},
-                                    created_by, datetime.now(timezone.utc))
-            versions.append(stored)
-            return copy.deepcopy(stored)
 
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +103,7 @@ class PostgresTenantRepository:
             with self._sessions() as session:
                 return [_mapping(r) for r in session.scalars(stmt).all()]
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
 
     def add_mapping_version(self, tenant_id: str, config: dict[str, Any], created_by: str) -> MappingVersion:
         try:
@@ -161,14 +122,14 @@ class PostgresTenantRepository:
             # PK (tenant_id, version) collision: a concurrent writer won. Caller may retry.
             raise MappingVersionConflict("mapping version conflict") from exc
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
 
     def _one(self, stmt):
         try:
             with self._sessions() as session:
                 return session.scalars(stmt).one_or_none()
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
 
 
 def _mapping(row: TenantMappingConfigRow) -> MappingVersion:
@@ -200,14 +161,5 @@ def seed_postgres(engine: Engine, tenant: Tenant, integration: TenantIntegration
     return created
 
 
-def seed_memory(repo: InMemoryTenantRepository, tenant: Tenant, integration: TenantIntegration | None,
-                mapping: dict[str, Any] | None) -> None:
-    repo.put_tenant(tenant)
-    if integration:
-        repo.put_integration(integration)
-    if mapping and repo.get_active_mapping(tenant.id) is None:
-        repo.add_mapping_version(tenant.id, mapping, "seed")
-
-
 __all__ = ["Tenant", "TenantIntegration", "MappingVersion", "MappingVersionConflict", "TenantRepository",
-           "InMemoryTenantRepository", "PostgresTenantRepository", "seed_postgres", "seed_memory"]
+           "PostgresTenantRepository", "seed_postgres"]

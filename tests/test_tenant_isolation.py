@@ -3,69 +3,17 @@
 from __future__ import annotations
 
 import pytest
-from fastapi.testclient import TestClient
 
 from app.mapping.mapper import MappingConfigError
-from app.repositories.sync_history import InMemorySyncHistoryRepository
 from app.repositories.tenants import TenantIntegration
 from app.schemas.sync import SyncStatus
-from app.services.account_sync import AccountSyncService
 from app.services.secrets import EnvSecretResolver, SecretResolutionError, secret_env_name
+from app.services.account_sync import AccountSyncService
 from app.services.tenant_context import DbMappingProvider, TenantConnectionError, TenantConnectionProvider
-from mock_crm import main as mock_crm
-from mock_internal import main as mock_internal
-from tests.auth_helpers import test_tenants
-from tests.conftest import cms_settings, crm_settings
-from tests.test_api_security import HARBOR_MAPPING, MAPPING
-
-SECRETS = {
-    "IL_MERIDIAN__CRM_CLIENT_SECRET": "meridian-crm-secret",
-    "IL_MERIDIAN__CMS_API_KEY": "meridian-cms-key",
-    "IL_HARBOR__CRM_CLIENT_SECRET": "harbor-crm-secret",
-    "IL_HARBOR__CMS_API_KEY": "harbor-cms-key",
-}
-
-
-class World:
-    """Two tenants, each with its own CRM org and CMS instance (in-process)."""
-
-    def __init__(self):
-        self.crm = {
-            "meridian": mock_crm.create_app(app_env="test", dataset="meridian", client_id="meridian-client",
-                                            client_secret=SECRETS["IL_MERIDIAN__CRM_CLIENT_SECRET"]),
-            "harbor": mock_crm.create_app(app_env="test", dataset="harbor", client_id="harbor-client",
-                                          client_secret=SECRETS["IL_HARBOR__CRM_CLIENT_SECRET"]),
-        }
-        self.cms = {
-            "meridian": mock_internal.create_app(app_env="test", api_key=SECRETS["IL_MERIDIAN__CMS_API_KEY"]),
-            "harbor": mock_internal.create_app(app_env="test", api_key=SECRETS["IL_HARBOR__CMS_API_KEY"]),
-        }
-        self.clients: dict[str, TestClient] = {}
-        self.repo = test_tenants()
-        self.repo.add_mapping_version("meridian", MAPPING, "seed")
-        self.repo.add_mapping_version("harbor", HARBOR_MAPPING, "seed")
-        self.secrets = dict(SECRETS)
-        self.provider = TenantConnectionProvider(
-            self.repo, EnvSecretResolver(self.secrets, app_env="test"),
-            crm_defaults=crm_settings(), cms_defaults=cms_settings(), http_client_factory=self.route)
-        self.history = InMemorySyncHistoryRepository()
-        self.service = AccountSyncService(connections=self.provider, mappings=DbMappingProvider(self.repo),
-                                          history=self.history)
-
-    def route(self, base_url: str) -> TestClient:
-        # http://crm-meridian.test -> the meridian CRM app, etc.
-        host = base_url.split("//", 1)[1].split("/", 1)[0]
-        kind, tenant = host.split(".")[0].split("-", 1)
-        if base_url not in self.clients:
-            app = (self.crm if kind == "crm" else self.cms)[tenant]
-            self.clients[base_url] = TestClient(app, base_url=f"http://{host}")
-        return self.clients[base_url]
-
-    def crm_state(self, tenant):
-        return self.crm[tenant].state.crm
-
-    def cms_state(self, tenant):
-        return self.cms[tenant].state.cms
+from tests.support.clients import cms_settings, crm_settings
+from tests.support.tenants import World, in_memory_tenants, integration
+from tests.support.data import MAPPING
+from tests.support.fakes import InProcessSyncLocks
 
 
 @pytest.fixture
@@ -139,7 +87,7 @@ def test_history_isolated_by_tenant(world):
 
 
 def test_stored_mapping_for_wrong_tenant_is_rejected():
-    repo = test_tenants()
+    repo = in_memory_tenants()
     repo._mappings["harbor"] = [type("V", (), {"version": 1, "config": MAPPING})()]  # corrupted row
     with pytest.raises(MappingConfigError, match="different tenant"):
         DbMappingProvider(repo).get("harbor")
@@ -206,3 +154,27 @@ def test_resolver_missing_and_dev_values_in_production():
 
 def test_connection_error_type():
     assert TenantConnectionError.code == "tenant_connection_invalid"
+
+
+# --- production: tenant endpoints must be HTTPS (replaces the former global URL checks) ---
+def test_production_refuses_plain_http_tenant_endpoints(world):
+    provider = TenantConnectionProvider(world.repo, EnvSecretResolver(world.secrets, app_env="test"),
+                                        crm_defaults=crm_settings(), cms_defaults=cms_settings(),
+                                        require_https=True, http_client_factory=world.route)
+    service = AccountSyncService(connections=provider, mappings=DbMappingProvider(world.repo),
+                                 history=world.history, locks=InProcessSyncLocks())
+    r = service.sync_account("meridian", "SF-1001")
+    assert (r.status, r.error.code, r.error.retryable) == (SyncStatus.FAILED, "tenant_connection_invalid", False)
+    assert "crm_base_url" in r.error.message and "cms_base_url" in r.error.message
+    assert world.crm_state("meridian").account_reads == 0 and world.crm_state("meridian").tokens == {}
+
+
+def test_production_accepts_https_tenant_endpoints(world):
+    world.repo.put_integration(integration("meridian", crm_base_url="https://crm.meridian.example",
+                                           crm_token_url="https://crm.meridian.example/oauth/token",
+                                           cms_base_url="https://cms.meridian.example"))
+    provider = TenantConnectionProvider(world.repo, EnvSecretResolver(world.secrets, app_env="test"),
+                                        crm_defaults=crm_settings(), cms_defaults=cms_settings(),
+                                        require_https=True, http_client_factory=lambda url: None)
+    clients = provider.for_tenant("meridian")
+    assert clients.crm is not None and clients.destination is not None

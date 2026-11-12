@@ -12,37 +12,17 @@ import pytest
 from sqlalchemy import text
 
 from app.db.engine import build_engine
-from app.repositories.sync_history import PostgresSyncHistoryRepository, RepositoryUnavailableError
+from app.repositories.sync_history import PostgresSyncHistoryRepository
+from app.db.errors import RepositoryUnavailableError
 from app.repositories.webhook_events import PostgresWebhookEventRepository
 from mock_crm import main as mock_crm
 from mock_internal import main as mock_internal
 from tests.integration import _workers
-from tests.integration.conftest import db_settings
-from tests.integration.test_pg_sync import LiveServer
-from tests.integration.webhook_helpers import (
-    ALL_SECRETS,
-    build_service,
-    build_worker,
-    events,
-    ingest_direct,
-    seed_tenants,
-)
-from tests.test_tenant_isolation import World
-
-
-@pytest.fixture
-def world(pg_engine):
-    seed_tenants(pg_engine)
-    return World()  # in-process CRM/CMS per tenant, routed by base URL
-
-
-@pytest.fixture
-def service(pg_engine, world):
-    return build_service(pg_engine, http_client_factory=world.route)
-
-
-def by_id(engine):
-    return {str(e["id"]): e for e in events(engine)}
+from tests.support.db import db_settings
+from tests.support.servers import LiveServer
+from tests.support.data import ALL_SECRETS
+from tests.support.webhooks import build_service, build_worker, by_id, events, ingest_direct, seed_tenants
+from tests.support.concurrency import join_all, pool_results, spawned_process, start_threads, wait_until
 
 
 # --------------------------------------------------------------------------- #
@@ -96,7 +76,7 @@ def test_suspended_tenant_events_fail_without_syncing(pg_engine, world, service)
 
 
 def test_ignored_events_are_never_claimed(pg_engine, world, service):
-    from tests.integration.webhook_helpers import event_body, ingestor, signed
+    from tests.support.webhooks import event_body, ingestor, signed
     body = event_body(event_type="contact.updated")
     ingestor(pg_engine).ingest("meridian", signed(body)["X-IntegrationLab-Signature"], body)
     assert build_worker(pg_engine, service).run_once() == 0
@@ -146,7 +126,7 @@ def test_concurrent_worker_processes_never_double_process(pg_engine, pg_url, tmp
                                         (pg_url, ALL_SECRETS, f"w{i}", 6.0, barrier)) for i in range(4)]
             time.sleep(2.0)
             open(barrier, "w").close()
-            results = [p.get(timeout=120) for p in pending]
+            results = pool_results(pending, timeout=120, what="4 worker processes draining 30 events")
 
         rows = by_id(pg_engine)
         assert sorted(rows) == sorted(ids)
@@ -177,11 +157,8 @@ def test_skip_locked_claims_are_disjoint_under_contention(pg_engine, world):
             with lock:
                 claimed.extend(e.id for e in got)
 
-    threads = [threading.Thread(target=claimer, args=(i,)) for i in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    threads = start_threads([lambda i=i: claimer(i) for i in range(8)], name="claimer")
+    join_all(threads, timeout=60, what="8 threads claiming 40 events")
     assert len(claimed) == 40 and len(set(claimed)) == 40
 
 
@@ -191,16 +168,13 @@ def test_skip_locked_claims_are_disjoint_under_contention(pg_engine, world):
 def test_killed_worker_event_is_recovered_by_another_worker(pg_engine, pg_url, world, service, tmp_path):
     [eid] = ingest_direct(pg_engine, 1, "SF-1002")
     ready = tmp_path / "claimed"
-    ctx = multiprocessing.get_context("spawn")
-    doomed = ctx.Process(target=_workers.claim_and_hang, args=(pg_url, 2.0, str(ready)))
-    doomed.start()
-    deadline = time.time() + 30
-    while not ready.exists():
-        assert time.time() < deadline
-        time.sleep(0.05)
-    assert by_id(pg_engine)[eid]["status"] == "processing"
-    os.kill(doomed.pid, signal.SIGKILL)  # crash mid-processing: no completion, no cleanup
-    doomed.join(10)
+    # spawned_process kills and reaps the child in `finally`, even if an assertion below fails.
+    with spawned_process(_workers.claim_and_hang, (pg_url, 2.0, str(ready))) as doomed:
+        wait_until(ready.exists, timeout=30, what="doomed worker to claim the event")
+        assert by_id(pg_engine)[eid]["status"] == "processing"
+        os.kill(doomed.pid, signal.SIGKILL)  # crash mid-processing: no completion, no cleanup
+        doomed.join(10)
+        assert not doomed.is_alive(), "SIGKILLed worker did not exit"
 
     survivor = build_worker(pg_engine, service)
     assert survivor.run_once() == 0  # lease still valid: not stolen early
@@ -318,7 +292,9 @@ def test_events_survive_restart_and_are_processed_by_a_new_worker_process(pg_eng
         barrier = tmp_path / "go"
         barrier.touch()
         ctx = multiprocessing.get_context("spawn")
-        with ctx.Pool(1) as pool:  # brand-new process
-            result = pool.apply(_workers.run_event_worker, (pg_url, ALL_SECRETS, "fresh", 4.0, str(barrier)))
+        with ctx.Pool(1) as pool:  # brand-new process; __exit__ terminates it even on failure
+            [result] = pool_results([pool.apply_async(_workers.run_event_worker,
+                                                      (pg_url, ALL_SECRETS, "fresh", 4.0, str(barrier)))],
+                                    timeout=120, what="fresh worker process draining 5 events")
         assert result["succeeded"] == 5
         assert all(by_id(pg_engine)[i]["status"] == "succeeded" for i in ids)

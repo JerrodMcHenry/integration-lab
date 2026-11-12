@@ -18,7 +18,7 @@ System (CMS). Both external systems are simulated by separate mock services.
                      │   integrations/crm_client  mapping/mapper  integrations/internal_client  repositories/  │
                      │   (OAuth2 CC, retries)     (JSON config,   (API key, idempotent         sync_history   │
                      │                            whitelisted     creates, retries)            (Protocol +    │
-                     │                            transforms)                                   in-memory)    │
+                     │                            transforms)                                   PostgreSQL)   │
                      └───────────│──────────────────────────────────────────│────────────────────────────────┘
                                  ▼                                           ▼
                      Mock CRM (:8001)                              Mock Meridian CMS (:8002)
@@ -29,7 +29,7 @@ System (CMS). Both external systems are simulated by separate mock services.
 
 | Component | Path | Status |
 |---|---|---|
-| Health, `POST /accounts` (validation only, no persistence) | `app/main.py` | ✅ |
+| Health and readiness endpoints | `app/main.py` | ✅ |
 | Environment config, production safety checks | `app/core/config.py` | ✅ |
 | CRM client | `app/integrations/crm_client.py` | ✅ |
 | Internal CMS client | `app/integrations/internal_client.py` | ✅ |
@@ -37,8 +37,8 @@ System (CMS). Both external systems are simulated by separate mock services.
 | Destination contract & field ownership | `app/schemas/internal_customer.py` | ✅ |
 | Customer-specific field mapping | `app/mapping/` | ✅ file-based |
 | Sync service | `app/services/account_sync.py` | ✅ |
-| Sync history | `app/repositories/sync_history.py` | ✅ PostgreSQL (in-memory fallback for tests/local) |
-| Per-account concurrency lock | `app/services/locks.py` | ✅ PostgreSQL advisory locks (in-process fallback) |
+| Sync history | `app/repositories/sync_history.py` | ✅ PostgreSQL (in-memory fake for unit tests only) |
+| Per-account concurrency lock | `app/services/locks.py` | ✅ PostgreSQL advisory locks (in-process fake for unit tests only) |
 | Schema & migrations | `app/db/models.py`, `migrations/` | ✅ Alembic `0001` |
 | Docker Compose stack | `docker-compose.yml`, `Dockerfile` | ✅ |
 | Sync API | `app/api/sync.py` | ✅ OIDC-authenticated, RBAC, tenant from token |
@@ -140,9 +140,9 @@ those fields. An optional CRM field that is empty clears the destination value.
                                    PostgreSQL 18 (docker compose, 127.0.0.1:5434)
 ```
 
-- **Wiring:** `DATABASE_URL` set → `PostgresSyncHistoryRepository` +
-  `PostgresAdvisorySyncLocks`. Unset → in-memory history + in-process locks,
-  with a startup WARNING. Production refuses to start without `DATABASE_URL`.
+- **Wiring:** `app/wiring.py` always builds the PostgreSQL implementations.
+  `DATABASE_URL` is required in every environment: the API, worker and CLI
+  refuse to start without it. In-memory fakes live only in `tests/support/fakes.py`.
 - **Engine:** `pool_pre_ping` (survives DB restarts), `pool_recycle=1800`,
   bounded pool (`DB_POOL_SIZE` + `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`),
   connect timeout, `hide_parameters=True` so SQL parameters never reach logs.
@@ -227,7 +227,7 @@ lock statement replaced by a no-op, both tests fail.
 |---|---|
 | DB down at lock time | No upstream calls. Record `acquire_lock/database_unavailable`. History write also fails → `HistoryPersistenceError` → HTTP 503, `X-Sync-History-Persisted: false`, record logged at ERROR |
 | History write fails after a successful sync | HTTP 503 with the real outcome (e.g. `created`) in the body, header `false`, record logged in full (identifiers only). The lock is still released |
-| `GET /sync/history` while DB down | HTTP 503 `{"detail": "Sync history storage unavailable"}` |
+| `GET /sync/history` (or any route without its own handling) while DB down | HTTP 503 `{"detail": "database unavailable; retry later"}` (500 `database error` for non-connectivity failures) |
 | DB restarted / connections killed | next checkout reconnects (`pool_pre_ping`) |
 | `/health/ready` | 503 when the DB doesn't answer `SELECT 1`. `/health` (liveness) is unaffected |
 
@@ -255,9 +255,10 @@ Each tenant has its own CRM org and CMS instance. In compose: Meridian →
 Clients are cached per (tenant, config + secret fingerprint), so rotating a
 secret or editing a connection rebuilds the clients automatically.
 
-Static clients (`AccountSyncService(crm=…, destination=…)`) remain supported
-for single-tenant tests. In the database-less fallback, tenants are seeded in
-memory from `seed/dev_tenants.json`.
+`AccountSyncService` has one constructor: `connections`, `mappings`, `history`,
+`locks`, all required. Unit tests pass test fakes (`StaticConnections`,
+`InProcessSyncLocks`, in-memory repositories) from `tests/support/fakes.py`.
+In production every tenant endpoint must be HTTPS.
 
 ## Concurrency lock: lost-lock mitigation (strategy; not yet implemented)
 

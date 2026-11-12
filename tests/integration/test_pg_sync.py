@@ -4,26 +4,27 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
-import socket
 import threading
 import time
 
-import httpx
 import pytest
-import uvicorn
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_sync_history, get_sync_service
+from app.api.dependencies import get_sync_history, get_sync_service
 from app.main import app
-from app.mapping.mapper import MappingRegistry
-from app.repositories.sync_history import InMemorySyncHistoryRepository, PostgresSyncHistoryRepository
+from tests.support.mappings import MappingRegistry
+from app.repositories.sync_history import PostgresSyncHistoryRepository
+from tests.support.fakes import InMemorySyncHistoryRepository
 from app.schemas.sync import SyncStage, SyncStatus
 from app.services.account_sync import AccountSyncService, HistoryPersistenceError
 from app.services.locks import PostgresAdvisorySyncLocks
 from mock_crm import main as mock_crm
 from mock_internal import main as mock_internal
-from tests.conftest import CMS_KEY, MAPPING_DIR
+from tests.support.data import CMS_KEY, MAPPING_DIR
 from tests.integration import _workers
+from tests.support.servers import LiveServer
+from tests.support.concurrency import join_all, pool_results, start_threads, wait_event
+from tests.support.fakes import StaticConnections
 
 T = "meridian"
 
@@ -31,26 +32,6 @@ T = "meridian"
 # --------------------------------------------------------------------------- #
 # Live mock services on real sockets (shared by all worker processes)
 # --------------------------------------------------------------------------- #
-class LiveServer:
-    def __init__(self, asgi_app):
-        self.app = asgi_app
-        sock = socket.socket()
-        sock.bind(("127.0.0.1", 0))
-        self.url = f"http://127.0.0.1:{sock.getsockname()[1]}"
-        self.server = uvicorn.Server(uvicorn.Config(asgi_app, log_level="warning"))
-        self.thread = threading.Thread(target=self.server.run, kwargs={"sockets": [sock]}, daemon=True)
-
-    def __enter__(self):
-        self.thread.start()
-        deadline = time.time() + 10
-        while not self.server.started:
-            assert time.time() < deadline, "live server failed to start"
-            time.sleep(0.02)
-        return self
-
-    def __exit__(self, *_):
-        self.server.should_exit = True
-        self.thread.join(timeout=5)
 
 
 @pytest.fixture
@@ -62,7 +43,7 @@ def live_mocks():
 
 def pg_service(engine, crm_client, cms_client, history=None, lock_engine=None) -> AccountSyncService:
     return AccountSyncService(
-        crm=crm_client, destination=cms_client, mappings=MappingRegistry(MAPPING_DIR),
+        connections=StaticConnections(crm_client, cms_client), mappings=MappingRegistry(MAPPING_DIR),
         history=history or PostgresSyncHistoryRepository(engine),
         locks=PostgresAdvisorySyncLocks(lock_engine or engine, lock_timeout_seconds=5),
     )
@@ -82,7 +63,7 @@ def test_concurrent_syncs_from_separate_processes(pg_url, pg_engine, live_mocks,
                    for _ in range(n)]
         time.sleep(2.0)
         open(barrier, "w").close()
-        results = [p.get(timeout=120) for p in pending]
+        results = pool_results(pending, timeout=120, what=f"{n} sync processes")
 
     assert len({r["pid"] for r in results}) == n
     statuses = sorted(r["status"] for r in results)
@@ -99,12 +80,8 @@ def test_concurrent_syncs_from_separate_processes(pg_url, pg_engine, live_mocks,
 def test_threads_in_one_process_also_serialised(pg_engine, crm_client, cms_client, cms_app):
     service = pg_service(pg_engine, crm_client, cms_client)
     results = []
-    threads = [threading.Thread(target=lambda: results.append(service.sync_account(T, "SF-1002")))
-               for _ in range(5)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    threads = start_threads([lambda: results.append(service.sync_account(T, "SF-1002"))] * 5)
+    join_all(threads, timeout=60, what="5 concurrent syncs of SF-1002")
     assert sorted(r.status.value for r in results) == ["created"] + ["unchanged"] * 4
     assert len(cms_app.app.state.cms.customers) == 1
 
@@ -113,7 +90,7 @@ def test_threads_in_one_process_also_serialised(pg_engine, crm_client, cms_clien
 # Semantics preserved with PostgreSQL backing
 # --------------------------------------------------------------------------- #
 def test_sync_semantics_unchanged_with_postgres(pg_engine, crm_client, cms_client, cms_app, crm_app):
-    from tests.conftest import cms_headers, crm_patch
+    from tests.support.clients import cms_headers, crm_patch
 
     service = pg_service(pg_engine, crm_client, cms_client)
     created = service.sync_account(T, "SF-1002")
@@ -175,7 +152,7 @@ def test_history_write_fails_after_successful_sync(pg_engine, dead_engine, crm_c
     assert len(cms_app.app.state.cms.customers) == 1  # the sync itself happened
     assert '"status":"created"' in caplog.text      # and is recoverable from logs
     # The lock was released despite the error.
-    from tests.integration.test_pg_locks import try_lock_elsewhere
+    from tests.support.db import try_lock_elsewhere
     assert try_lock_elsewhere(str(pg_engine.url.render_as_string(hide_password=False)), T, "SF-1001")
 
 
@@ -196,7 +173,7 @@ def api_factory(auth):
 
 def test_api_history_survives_restart(pg_url, pg_engine, crm_client, cms_client, api_factory):
     from app.db.engine import build_engine
-    from tests.integration.conftest import db_settings
+    from tests.support.db import db_settings
 
     api = api_factory(pg_service(pg_engine, crm_client, cms_client), PostgresSyncHistoryRepository(pg_engine))
     r = api.post("/sync/accounts/SF-1001")
@@ -221,12 +198,12 @@ def test_api_returns_503_when_database_down(dead_engine, crm_client, cms_client,
     assert r.headers["X-Sync-History-Persisted"] == "false"
     assert r.json()["error"]["code"] == "database_unavailable"
     h = api.get("/sync/history")
-    assert h.status_code == 503 and h.json() == {"detail": "Sync history storage unavailable"}
+    assert h.status_code == 503 and h.json() == {"detail": "database unavailable; retry later"}
 
 
 def test_api_lock_timeout_returns_409(pg_engine, crm_client, cms_client, api_factory):
     service = AccountSyncService(
-        crm=crm_client, destination=cms_client, mappings=MappingRegistry(MAPPING_DIR),
+        connections=StaticConnections(crm_client, cms_client), mappings=MappingRegistry(MAPPING_DIR),
         history=PostgresSyncHistoryRepository(pg_engine),
         locks=PostgresAdvisorySyncLocks(pg_engine, lock_timeout_seconds=0.2))
     api = api_factory(service, PostgresSyncHistoryRepository(pg_engine))
@@ -237,14 +214,13 @@ def test_api_lock_timeout_returns_409(pg_engine, crm_client, cms_client, api_fac
             holder_in.set()
             release.wait(10)
 
-    t = threading.Thread(target=holder)
-    t.start()
-    holder_in.wait(5)
+    threads = start_threads([holder], name="holder")
     try:
+        wait_event(holder_in, timeout=5, what="holder to acquire the lock")
         r = api.post("/sync/accounts/SF-1001")
     finally:
         release.set()
-        t.join()
+        join_all(threads, timeout=15, what="lock holder to release")
     assert r.status_code == 409
     assert r.json()["error"] == {"code": "sync_lock_timeout",
                                  "message": "another sync of this account is still running",

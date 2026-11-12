@@ -42,7 +42,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.models import ERROR_MESSAGE_MAX, WebhookEventRow
 from app.repositories.audit import AuditEntry, emit_log, insert_audit
-from app.repositories.sync_history import _translate
+from app.db.errors import translate_db_error
 
 
 @dataclass(frozen=True)
@@ -219,10 +219,6 @@ _REPLAY_SQL = text("""
      WHERE id = :id AND tenant_id = :tenant AND status IN ('failed', 'dead_letter')
 """)
 
-_RENEW_SQL = text("""
-    UPDATE webhook_events SET lease_expires_at = now() + make_interval(secs => :lease_seconds)
-     WHERE id = :id AND claim_token = :token AND status = 'processing'
-""")
 
 
 class PostgresWebhookEventRepository:
@@ -252,7 +248,7 @@ class PostgresWebhookEventRepository:
                 return IngestResult(existing.id, False, existing.status,
                                     existing.payload_sha256 == ev.payload_sha256)
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
 
     # -- worker ---------------------------------------------------------- #
     def claim(self, worker_id: str, *, batch: int, lease_seconds: float,
@@ -264,7 +260,7 @@ class PostgresWebhookEventRepository:
                                                  "lease_seconds": lease_seconds,
                                                  "max_attempts": max_attempts}).all()
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
         return [ClaimedEvent(r.id, r.tenant_id, r.event_id, r.event_type, r.crm_account_id, r.attempts,
                              r.claim_token) for r in rows]
 
@@ -282,16 +278,7 @@ class PostgresWebhookEventRepository:
             with self._engine.begin() as conn:
                 return conn.execute(_COMPLETE_SQL, params).first() is not None
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
-
-    def renew_lease(self, event: ClaimedEvent, lease_seconds: float) -> bool:
-        """Extend the lease if still owned (fenced by claim_token)."""
-        try:
-            with self._engine.begin() as conn:
-                return conn.execute(_RENEW_SQL, {"id": event.id, "token": event.claim_token,
-                                                 "lease_seconds": lease_seconds}).rowcount == 1
-        except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
 
     # -- manual replay (state change + audit in one transaction) ----------- #
     def replay(self, tenant_id: str, event_uuid: uuid.UUID, *, audit: AuditEntry) -> ReplayResult:
@@ -308,7 +295,7 @@ class PostgresWebhookEventRepository:
                                                  "outcome": "success" if replayed else "rejected",
                                                  "details": {**audit.details, "previous_status": current}}))
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
         emit_log(AuditEntry(**{**audit.__dict__, "outcome": "success" if replayed else "rejected",
                                "details": {**audit.details, "previous_status": current}}))
         return ReplayResult(True, replayed, current)
@@ -333,7 +320,7 @@ class PostgresWebhookEventRepository:
                                                          "target_id": str(eid)}))
                         done.append(eid)
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
         emit_log(AuditEntry(**{**audit.__dict__, "outcome": "success",
                                "details": {**audit.details, "replayed": len(done)}}))
         return done
@@ -347,68 +334,7 @@ class PostgresWebhookEventRepository:
                     "WHERE tenant_id = :t AND event_uuid = :id ORDER BY id"), {"t": tenant_id, "id": event_uuid})
                 return [AttemptView(**r._mapping) for r in rows]
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
-
-    # -- metrics ---------------------------------------------------------- #
-    def metrics(self, tenant_id: str | None) -> list[dict[str, Any]]:
-        """Per-tenant queue metrics (all tenants when ``tenant_id`` is None; platform use only)."""
-        where = "WHERE tenant_id = :t" if tenant_id else ""
-        sql = f"""
-            SELECT tenant_id,
-                   count(*) FILTER (WHERE status = 'pending')                                AS pending,
-                   count(*) FILTER (WHERE status = 'pending' AND available_at <= now())      AS ready,
-                   count(*) FILTER (WHERE status = 'pending' AND attempts > 0)              AS retry_backlog,
-                   count(*) FILTER (WHERE status = 'processing')                             AS processing,
-                   count(*) FILTER (WHERE status = 'processing' AND lease_expires_at < now()) AS expired_leases,
-                   count(*) FILTER (WHERE status = 'failed')                                 AS failed,
-                   count(*) FILTER (WHERE status = 'dead_letter')                            AS dead_letter,
-                   count(*) FILTER (WHERE status = 'succeeded'
-                                      AND processed_at > now() - interval '1 hour')          AS succeeded_1h,
-                   extract(epoch FROM now() - min(received_at) FILTER (WHERE status = 'pending')) AS oldest_pending_s,
-                   percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM processed_at - received_at))
-                       FILTER (WHERE status = 'succeeded' AND processed_at > now() - interval '1 hour') AS latency_p50_s,
-                   percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM processed_at - received_at))
-                       FILTER (WHERE status = 'succeeded' AND processed_at > now() - interval '1 hour') AS latency_p95_s,
-                   max(extract(epoch FROM processed_at - received_at))
-                       FILTER (WHERE status = 'succeeded' AND processed_at > now() - interval '1 hour') AS latency_max_s
-              FROM webhook_events {where}
-             GROUP BY tenant_id ORDER BY tenant_id
-        """
-        try:
-            with self._engine.connect() as conn:
-                return [dict(r._mapping) for r in conn.execute(text(sql), {"t": tenant_id})]
-        except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
-
-    # -- worker heartbeats -------------------------------------------------- #
-    def heartbeat(self, *, worker_id: str, hostname: str, pid: int, state: str,
-                  current_event_id: uuid.UUID | None, succeeded: int, failed: int) -> None:
-        try:
-            with self._engine.begin() as conn:
-                conn.execute(text("""
-                    INSERT INTO worker_heartbeats (worker_id, hostname, pid, state, current_event_id,
-                                                   events_succeeded, events_failed)
-                    VALUES (:w, :h, :p, :s, :e, :ok, :ko)
-                    ON CONFLICT (worker_id) DO UPDATE
-                       SET last_seen_at = now(), state = EXCLUDED.state,
-                           current_event_id = EXCLUDED.current_event_id,
-                           events_succeeded = EXCLUDED.events_succeeded, events_failed = EXCLUDED.events_failed
-                """), {"w": worker_id[:128], "h": hostname[:255], "p": pid, "s": state, "e": current_event_id,
-                       "ok": succeeded, "ko": failed})
-        except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
-
-    def workers(self, *, stale_after_seconds: float) -> list[dict[str, Any]]:
-        try:
-            with self._engine.connect() as conn:
-                return [dict(r._mapping) for r in conn.execute(text("""
-                    SELECT worker_id, hostname, pid, state, started_at, last_seen_at, events_succeeded,
-                           events_failed,
-                           (state <> 'stopped' AND last_seen_at > now() - make_interval(secs => :stale)) AS healthy
-                      FROM worker_heartbeats ORDER BY last_seen_at DESC LIMIT 200
-                """), {"stale": stale_after_seconds})]
-        except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
 
     # -- reads (tenant-scoped) ------------------------------------------- #
     def get(self, tenant_id: str, event_id: uuid.UUID) -> WebhookEvent | None:
@@ -418,7 +344,7 @@ class PostgresWebhookEventRepository:
             with self._sessions() as s:
                 row = s.scalars(stmt).one_or_none()
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
         return _view(row) if row else None
 
     def list_recent(self, tenant_id: str, *, limit: int = 50, status: str | None = None) -> list[WebhookEvent]:
@@ -430,7 +356,7 @@ class PostgresWebhookEventRepository:
             with self._sessions() as s:
                 return [_view(r) for r in s.scalars(stmt).all()]
         except SQLAlchemyError as exc:
-            raise _translate(exc) from exc
+            raise translate_db_error(exc) from exc
 
 
 def _view(r: WebhookEventRow) -> WebhookEvent:

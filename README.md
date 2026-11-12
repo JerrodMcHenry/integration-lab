@@ -90,8 +90,7 @@ uvicorn app.main:app --port 8000
 python -m app.worker                         # background event worker
 ```
 
-Without `DATABASE_URL`, the app falls back to in-memory history and
-in-process locks and logs a warning (development only; production refuses to start).
+PostgreSQL is required: the API, worker and CLI refuse to start without `DATABASE_URL`.
 
 ## Tests
 
@@ -102,9 +101,11 @@ REQUIRE_POSTGRES=1 pytest    # fail (instead of skip) if PostgreSQL is unreachab
 pytest -m "not postgres"     # unit tests only
 ```
 
-Integration tests use `TEST_DATABASE_URL` (database `integrationlab_test`,
-created automatically) and refuse to run against a database whose name
-doesn't end in `_test`.
+Integration tests use only `TEST_DATABASE_URL` (database `integrationlab_test`,
+created automatically). The test process never sees the development
+`DATABASE_URL`: it's replaced by an unroutable sentinel, so a test can't reach
+the dev database by accident. The run aborts if the test database isn't
+PostgreSQL, isn't named `*_test`, or is the development database.
 
 ## Database migrations
 
@@ -122,6 +123,9 @@ Only do that with explicit approval. Concurrent `upgrade` runs are serialised
 by an advisory lock.
 
 ## Documentation
+
+**New here? Start with [docs/codebase-guide.md](docs/codebase-guide.md)** (15–20 min).
+Engineering rules for contributors and AI agents: [CLAUDE.md](CLAUDE.md).
 
 - [Architecture](docs/architecture.md): includes persistence, the lock lifecycle, multi-tenancy and the lost-lock mitigation
 - [API contracts](docs/api-contracts.md)
