@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from app.schemas.account import AccountCreate
 
+
 app = FastAPI()
 
 @app.get("/health")
@@ -17,3 +18,4 @@ def create_account(account: AccountCreate):
         "message": "Account recieved successfully",
         "account": account
     }
+    
