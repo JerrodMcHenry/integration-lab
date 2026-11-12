@@ -29,6 +29,7 @@ tenant, using that tenant's CRM, CMS and mapping. Always returns a `SyncRecord`.
 | 409 | `sync_lock_timeout` (another sync of this account is running) |
 | 422 | `mapping_failed` / `mapping_config_invalid` |
 | 500 | `tenant_connection_invalid` (integration row or secret missing/invalid), `unexpected_error` |
+| 502 | (M7) also `sync_lock_lost` / `processing_deadline_exceeded`: ownership check refused the destination write (retryable) |
 | 502 | upstream error (`crm_unavailable`, `destination_unavailable`, …) |
 | 503 | `database_unavailable`, or history not persisted (`X-Sync-History-Persisted: false`) |
 | 504 | upstream timeout |
@@ -108,7 +109,37 @@ Returns the caller's tenant's events, newest first:
 received_at, processed_at, last_error: {code, message, retryable} | null, sync_record_id}`.
 
 ### `GET /webhooks/events/{id}` (requires `history:read`)
-404 if missing or owned by another tenant.
+404 if missing or owned by another tenant. Since M7 the response also has
+`available_at`, `dead_lettered_at`, `replay_count` and `last_replayed_at`.
+`status` may be `dead_letter`.
+
+### `GET /webhooks/events/{id}/attempts` (requires `history:read`)
+Retry history, oldest first: `[{attempt, worker_id, started_at, finished_at,
+outcome: succeeded|retry_scheduled|failed|dead_letter|lease_expired, error_code,
+error_message, retryable, next_attempt_at, sync_record_id}]`. Attempt numbers restart at 1 after a replay.
+
+### `POST /webhooks/events/{id}/replay` (requires `sync:run`, audited)
+Body (optional): `{"reason": "≤ 500 chars"}`.
+| Status | Meaning |
+|---|---|
+| 202 | `{"status":"replayed","id":…,"previous_status":"failed"\|"dead_letter","new_status":"pending"}`. Fresh attempt budget |
+| 403 | missing `sync:run` (**recorded in the audit log as `denied`**) |
+| 404 | no such event in your tenant |
+| 409 | event is `pending`, `processing`, `succeeded` or `ignored` (audited as `rejected`) |
+| 503 | event store unavailable |
+
+### `POST /webhooks/events/replay` (requires `sync:run`, audited)
+Body: `{"statuses": ["dead_letter"] | ["failed"] | both, "limit": 1–100 (default 50), "reason": "…"}`.
+Replays the oldest matching events in your tenant. Response `{"replayed": n, "ids": [...]}`.
+One audit record per event.
+
+## Operations
+
+| Endpoint | Permission | Response |
+|---|---|---|
+| `GET /ops/metrics` | `history:read` | `{tenant_id, events: {pending, ready, retry_backlog, processing, expired_leases, failed, dead_letter, succeeded_1h, oldest_pending_s, latency_p50_s, latency_p95_s, latency_max_s}, workers: {healthy, total_seen, last_heartbeat_at}}` |
+| `GET /admin/audit?limit=&action=` | `config:read` | `[{occurred_at, actor, actor_client_id, action, outcome, target_type, target_id, details}]`, newest first |
+| `GET /metrics` | `Authorization: Bearer $METRICS_TOKEN` (not a user JWT). 404 when unset | Prometheus text: `integrationlab_events_{pending,ready,retry_backlog,processing,expired_leases,failed,dead_letter,succeeded_1h,oldest_pending_s,latency_p95_s}{tenant=…}`, `integrationlab_workers_healthy` |
 
 ## Health (public)
 

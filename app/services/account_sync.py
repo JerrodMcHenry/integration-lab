@@ -15,6 +15,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from pydantic import TypeAdapter, ValidationError
@@ -30,7 +31,7 @@ from app.schemas.internal_customer import (
     CustomerSyncPayload,
 )
 from app.schemas.sync import SyncErrorDetail, SyncRecord, SyncStage, SyncStatus
-from app.services.locks import InProcessSyncLocks, LockError, SyncLockProvider
+from app.services.locks import InProcessSyncLocks, LockError, LockHandle, LockLostError, SyncLockProvider
 from app.services.tenant_context import ConnectionProvider, StaticConnections, TenantConnectionError
 
 
@@ -42,6 +43,12 @@ logger = logging.getLogger(__name__)
 _FIELD_ADAPTERS = {
     name: TypeAdapter(field.annotation) for name, field in CustomerSyncPayload.model_fields.items()
 }
+
+
+class OwnershipLost(RuntimeError):
+    """Raised by a caller-supplied guard: this process may no longer write (e.g. lease deadline passed)."""
+
+    code = "processing_deadline_exceeded"
 
 
 class OwnershipViolationError(RuntimeError):
@@ -88,7 +95,8 @@ class AccountSyncService:
         self._locks: SyncLockProvider = locks or InProcessSyncLocks()
 
     # ------------------------------------------------------------------ #
-    def sync_account(self, tenant_id: str, crm_account_id: str) -> SyncRecord:
+    def sync_account(self, tenant_id: str, crm_account_id: str,
+                     *, guard: Callable[[], None] | None = None) -> SyncRecord:
         """Run one sync and persist its record.
 
         Raises ``HistoryPersistenceError`` only if the record can't be saved.
@@ -97,8 +105,9 @@ class AccountSyncService:
         started_at = datetime.now(timezone.utc)
         t0 = time.monotonic()
         try:
-            with self._locks.hold(tenant_id, crm_account_id):
-                record = self._execute(tenant_id, crm_account_id, started_at, t0)
+            with self._locks.hold(tenant_id, crm_account_id) as lock:
+                record = self._execute(tenant_id, crm_account_id, started_at, t0,
+                                       _WriteGate(lock, guard))
                 # Persist while still holding the lock so history order matches sync order.
                 self._persist(record)
                 return record
@@ -112,10 +121,10 @@ class AccountSyncService:
             return record
 
     def _execute(self, tenant_id: str, crm_account_id: str, started_at: datetime,
-                 t0: float) -> SyncRecord:
+                 t0: float, gate: _WriteGate | None = None) -> SyncRecord:
         ctx: dict[str, Any] = {}
         try:
-            status, extra = self._run(tenant_id, crm_account_id, ctx)
+            status, extra = self._run(tenant_id, crm_account_id, ctx, gate or _WriteGate(None, None))
             stage, error = None, None
         except _SyncFailure as failure:
             status, extra, stage, error = SyncStatus.FAILED, {}, failure.stage, failure.error
@@ -162,7 +171,8 @@ class AccountSyncService:
             ",".join(record.fields_changed) or "-", record.duration_ms)
 
     # ------------------------------------------------------------------ #
-    def _run(self, tenant_id: str, crm_account_id: str, ctx: dict[str, Any]) -> tuple[SyncStatus, dict]:
+    def _run(self, tenant_id: str, crm_account_id: str, ctx: dict[str, Any],
+             gate: _WriteGate) -> tuple[SyncStatus, dict]:
         # 1. Resolve the tenant's mapping (fail fast before any network I/O).
         try:
             mapper = self._mappings.get(tenant_id)
@@ -196,18 +206,23 @@ class AccountSyncService:
 
         # 5. Load into the destination.
         try:
-            return self._load(clients.destination, tenant_id, payload.external_crm_id, desired, ctx)
+            return self._load(clients.destination, tenant_id, payload.external_crm_id, desired, ctx, gate)
         except IntegrationError as exc:
             raise _SyncFailure(SyncStage.LOAD_DESTINATION, _detail(exc)) from exc
+        except (LockLostError, OwnershipLost) as exc:
+            # Refused to write: another worker may now own this account/event. Safe to retry.
+            raise _SyncFailure(SyncStage.LOAD_DESTINATION, SyncErrorDetail(
+                code=exc.code, message=str(exc), retryable=True)) from exc
 
     def _load(self, destination: InternalSystemClient, tenant_id: str, external_id: str,
-              desired: dict[str, Any], ctx: dict[str, Any]) -> tuple[SyncStatus, dict]:
+              desired: dict[str, Any], ctx: dict[str, Any], gate: _WriteGate) -> tuple[SyncStatus, dict]:
         _assert_crm_owned_only(desired)
         existing = destination.get_customer_by_external_id(external_id)
 
         if existing is None:
             body = _to_json(desired)
             try:
+                gate.check()  # ownership verified immediately before the destination write
                 created = destination.create_customer(
                     body, idempotency_key=_idempotency_key(tenant_id, body))
                 return SyncStatus.CREATED, {"customer_id": created["customer_id"],
@@ -228,6 +243,7 @@ class AccountSyncService:
             return SyncStatus.UNCHANGED, {}
 
         _assert_crm_owned_only(changes)
+        gate.check()  # ownership verified immediately before the destination write
         destination.update_customer(existing["customer_id"], _to_json(changes))
         return SyncStatus.UPDATED, {"fields_changed": sorted(changes)}
 
@@ -235,6 +251,29 @@ class AccountSyncService:
 # ---------------------------------------------------------------------- #
 # Helpers
 # ---------------------------------------------------------------------- #
+class _WriteGate:
+    """Checks run immediately before every destination write.
+
+    1. The per-account advisory lock is still held by this session (catches a
+       lost lock: killed session, idle backstop, failover).
+    2. An optional caller guard (the worker's lease-based processing deadline).
+
+    Limitation: this narrows but does not close the window. A lock lost
+    *during* the HTTP write itself isn't detected. Closing it fully needs
+    destination-side fencing (If-Match/version). See architecture.md.
+    """
+
+    def __init__(self, lock: LockHandle | None, guard: Callable[[], None] | None) -> None:
+        self._lock = lock
+        self._guard = guard
+
+    def check(self) -> None:
+        if self._guard is not None:
+            self._guard()
+        if self._lock is not None:
+            self._lock.verify()
+
+
 def _detail(exc: IntegrationError) -> SyncErrorDetail:
     return SyncErrorDetail(code=exc.code, message=str(exc), retryable=exc.retryable,
                            upstream_status=exc.status_code)

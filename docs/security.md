@@ -79,14 +79,32 @@ by an HMAC over its **raw body** with the tenant's webhook secret:
    holds only an allowlisted envelope (tested against DB contents and logs, plus
    a live check).
 
+## Audit and operational controls (Milestone 7)
+
+- **Audit log:** append-only at the database level (a trigger blocks
+  UPDATE, DELETE and TRUNCATE). Records replay (success/rejected/**denied**),
+  bulk replay, mapping publishes (success/rejected/denied) and retention purges.
+  `details` rejects keys resembling secrets, tokens, signatures or passwords.
+  Readable only by the tenant's admins (`GET /admin/audit`). Also emitted as
+  JSON log lines.
+- **Replay:** tenant-scoped (another tenant's event id → 404, no state change),
+  only from `failed`/`dead_letter`, atomic with its audit record, at most 100 per
+  bulk call.
+- **Platform metrics** (`/metrics`, all tenants) use a separate static token
+  (≥ 32 chars enforced in production), compared in constant time. A user JWT,
+  even an admin's, is not accepted. Disabled unless configured. Tenant users get
+  only their own `/ops/metrics`, with worker health as counts (no hostnames).
+- **Retention:** destructive cleanup is off by default and needs both
+  `RETENTION_ENABLED=true` and `--execute`. Audited.
+
 ## Permission model (RBAC)
 
 | Permission | viewer | operator | admin | Endpoints |
 |---|:-:|:-:|:-:|---|
 | `tenant:read` | ✅ | ✅ | ✅ | `GET /tenant` |
-| `history:read` | ✅ | ✅ | ✅ | `GET /sync/history`, `GET /sync/history/{id}`, `GET /webhooks/events`, `GET /webhooks/events/{id}` |
-| `sync:run` | | ✅ | ✅ | `POST /sync/accounts/{id}`, `POST /accounts` (legacy) |
-| `config:read` | | | ✅ | `GET /admin/integration`, `GET /admin/mapping`, `GET /admin/mapping/versions` |
+| `history:read` | ✅ | ✅ | ✅ | `GET /sync/history`, `GET /sync/history/{id}`, `GET /webhooks/events[/{id}[/attempts]]`, `GET /ops/metrics` |
+| `sync:run` | | ✅ | ✅ | `POST /sync/accounts/{id}`, `POST /accounts` (legacy), `POST /webhooks/events/{id}/replay`, `POST /webhooks/events/replay` |
+| `config:read` | | | ✅ | `GET /admin/integration`, `GET /admin/mapping`, `GET /admin/mapping/versions`, `GET /admin/audit` |
 | `config:write` | | | ✅ | `PUT /admin/mapping` |
 | (authenticated) | ✅ | ✅ | ✅ | `GET /me` |
 | (HMAC) | | | | `POST /webhooks/crm/{tenant_id}`, authenticated by tenant webhook signature |
@@ -174,4 +192,13 @@ the old logic (verified).
     CRM (payload fields aren't applied), which limits the impact to extra syncs.
 14. **Replay window relies on clock sync** between CRM and API (NTP). Skew
     beyond the tolerance causes rejections (fail closed).
-15. **No retention policy** for `webhook_events` yet (M7+).
+15. ~~No retention policy~~ Implemented in M7 (opt-in). The audit log grows
+    without bound by design. Archiving needs a DBA procedure.
+16. **Ownership checks narrow but don't close the stale-write window.** A lock
+    or lease lost *during* an in-flight destination HTTP call isn't detected
+    (see architecture.md). Destination-side conditional writes are needed for full fencing.
+17. **Audit completeness:** only the listed actions are audited. Failed
+    *authentication* (401) isn't written to the audit table (it's logged), to
+    avoid unauthenticated callers filling it.
+18. **`METRICS_TOKEN` is a long-lived shared secret** with read access to
+    cross-tenant aggregate counts. It must be stored and rotated like other secrets.

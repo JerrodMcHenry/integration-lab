@@ -5,7 +5,7 @@ customer accounts for the fictional financial-services firm **Meridian
 Capital** from a Salesforce-style CRM into Meridian's internal Customer
 Management System.
 
-> **Status: work in progress — Milestone 6 of 10 complete.** This is not
+> **Status: work in progress — Milestone 7 of 10 complete.** This is not
 > production software (see the remaining risks in [docs/security.md](docs/security.md)). See
 > [docs/architecture.md](docs/architecture.md) for what is implemented and
 > what is planned.
@@ -16,6 +16,10 @@ Management System.
   (HMAC over the raw body, 5-minute replay window), persisted before
   acknowledgement, deduplicated per tenant, and processed by background workers
   using `FOR UPDATE SKIP LOCKED` with crash-safe leases.
+- **Reliable recovery:** transient failures retry with bounded exponential
+  backoff and jitter, exhausted events go to dead-letter, operators replay with
+  full attempt history, and sensitive actions land in an append-only audit log.
+  Tenant metrics plus a Prometheus endpoint, and an opt-in retention policy.
 - **On-demand account sync** (`POST /sync/accounts/{id}`): CRM → mapping →
   internal CMS, with create, update (changed fields only), unchanged
   (no write) and stale-skip outcomes.
@@ -59,6 +63,9 @@ CRM=$(curl -s -u integrationlab-dev:dev-only-secret -d grant_type=client_credent
 curl -X PATCH -H "Authorization: Bearer $CRM" -H 'Content-Type: application/json' \
   -d '{"AnnualRevenue": 9000000}' localhost:8001/crm/accounts/SF-1002
 curl -H "Authorization: Bearer $TOKEN" localhost:8000/webhooks/events      # -> succeeded
+curl -H "Authorization: Bearer $TOKEN" localhost:8000/ops/metrics           # queue, retries, dead letters, latency
+curl -H "Authorization: Bearer $TOKEN" 'localhost:8000/webhooks/events?status=dead_letter'
+curl -X POST -H "Authorization: Bearer $TOKEN" localhost:8000/webhooks/events/<id>/replay
 docker compose stop                   # stop; data is kept in the integrationlab_pgdata volume
 ```
 

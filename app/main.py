@@ -6,6 +6,7 @@ from sqlalchemy import text
 
 from app.api.admin import router as admin_router
 from app.api.deps import get_engine
+from app.api.ops import router as ops_router
 from app.api.sync import router as sync_router
 from app.api.webhooks import router as webhooks_router
 from app.auth.dependencies import require
@@ -20,7 +21,7 @@ _settings = get_settings()
 
 app = FastAPI(
     title="IntegrationLab",
-    version="0.6.0",
+    version="0.7.0",
     # Interactive docs are a development convenience; not served in production.
     docs_url=None if _settings.is_production else "/docs",
     redoc_url=None if _settings.is_production else "/redoc",
@@ -29,6 +30,7 @@ app = FastAPI(
 app.include_router(sync_router)
 app.include_router(admin_router)
 app.include_router(webhooks_router)
+app.include_router(ops_router)
 
 
 @app.exception_handler(RepositoryError)

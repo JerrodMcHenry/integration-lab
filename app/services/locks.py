@@ -67,8 +67,24 @@ class LockUnavailableError(LockError):
     code = "database_unavailable"
 
 
+class LockLostError(LockError):
+    """Ownership check before a destination write found the lock no longer held."""
+
+    code = "sync_lock_lost"
+
+
+class LockHandle(Protocol):
+    def verify(self) -> None:
+        """Raise ``LockLostError`` unless this process still holds the lock."""
+
+
+class _AlwaysHeld:
+    def verify(self) -> None:
+        return None
+
+
 class SyncLockProvider(Protocol):
-    def hold(self, tenant_id: str, crm_account_id: str):  # -> ContextManager[None]
+    def hold(self, tenant_id: str, crm_account_id: str):  # -> ContextManager[LockHandle]
         ...
 
 
@@ -84,10 +100,10 @@ class InProcessSyncLocks:
         self._locks = [threading.Lock() for _ in range(stripes)]
 
     @contextmanager
-    def hold(self, tenant_id: str, crm_account_id: str) -> Iterator[None]:
+    def hold(self, tenant_id: str, crm_account_id: str) -> Iterator[LockHandle]:
         lock = self._locks[advisory_lock_key(tenant_id, crm_account_id) % len(self._locks)]
         with lock:
-            yield
+            yield _AlwaysHeld()
 
 
 class PostgresAdvisorySyncLocks:
@@ -99,7 +115,7 @@ class PostgresAdvisorySyncLocks:
         self._idle_timeout_ms = int(max_hold_seconds * 1000)
 
     @contextmanager
-    def hold(self, tenant_id: str, crm_account_id: str) -> Iterator[None]:
+    def hold(self, tenant_id: str, crm_account_id: str) -> Iterator[LockHandle]:
         key = advisory_lock_key(tenant_id, crm_account_id)
         try:
             conn = self._engine.connect().execution_options(isolation_level="AUTOCOMMIT")
@@ -124,7 +140,7 @@ class PostgresAdvisorySyncLocks:
 
             # --- critical section: caller's exceptions propagate unchanged ---
             try:
-                yield
+                yield _PgLockHandle(conn, key)
             finally:
                 # --- release ---
                 try:
@@ -136,6 +152,26 @@ class PostgresAdvisorySyncLocks:
             if not reusable:
                 _quiet(conn.invalidate)
             _quiet(conn.close)
+
+
+class _PgLockHandle:
+    """Ownership check on the lock's own session (autocommit, no transaction)."""
+
+    def __init__(self, conn, key: int) -> None:
+        self._conn = conn
+        self._classid = (key >> 32) & 0xFFFFFFFF
+        self._objid = key & 0xFFFFFFFF
+
+    def verify(self) -> None:
+        try:
+            held = self._conn.execute(text(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND granted "
+                "AND pid = pg_backend_pid() AND classid::bigint = :c AND objid::bigint = :o AND objsubid = 1)"),
+                {"c": self._classid, "o": self._objid}).scalar()
+        except SQLAlchemyError as exc:
+            raise LockLostError(f"lock session unavailable: {type(exc).__name__}") from exc
+        if not held:
+            raise LockLostError("advisory lock no longer held by this session")
 
 
 def _reset(conn) -> bool:

@@ -13,6 +13,7 @@ from app.auth.dependencies import get_principal
 from app.auth.tokens import Principal
 from app.core.config import CRMSettings, InternalSystemSettings, Settings, get_settings
 from app.db.engine import build_engine
+from app.repositories.audit import AuditRepository, InMemoryAuditRepository, PostgresAuditRepository
 from app.repositories.sync_history import (
     InMemorySyncHistoryRepository,
     PostgresSyncHistoryRepository,
@@ -47,6 +48,12 @@ def get_engine() -> Engine | None:
 def get_sync_history() -> SyncHistoryRepository:
     engine = get_engine()
     return PostgresSyncHistoryRepository(engine) if engine else InMemorySyncHistoryRepository()
+
+
+@lru_cache
+def get_audit_repository() -> AuditRepository:
+    engine = get_engine()
+    return PostgresAuditRepository(engine) if engine else InMemoryAuditRepository()
 
 
 @lru_cache

@@ -99,3 +99,37 @@ def require(permission: Permission) -> Callable[..., Principal]:
 
     dependency.__name__ = f"require_{permission.name.lower()}"
     return dependency
+
+
+def get_audit_repository():
+    from app.api.deps import get_audit_repository as _get
+
+    return _get()
+
+
+def require_audited(permission: Permission, action: str) -> Callable[..., Principal]:
+    """Like ``require`` but a denial is also written to the audit log (best effort)."""
+
+    def dependency(principal: Annotated[Principal, Depends(get_principal)],
+                   audit=Depends(get_audit_repository)) -> Principal:
+        if not principal.has(permission):
+            from app.repositories.audit import AuditEntry
+
+            try:
+                audit.record(AuditEntry(actor=principal.subject, actor_client_id=principal.client_id,
+                                        tenant_id=principal.tenant_id, action=action, outcome="denied",
+                                        details={"missing_permission": permission.value,
+                                                 "roles": sorted(r.value for r in principal.roles)}))
+            except Exception as exc:  # noqa: BLE001 - auditing must not turn a 403 into a 500
+                logger.error("audit.write_failed action=%s error=%s", action, type(exc).__name__)
+            logger.info("auth.forbidden tenant=%s sub=%s needs=%s", principal.tenant_id,
+                        principal.subject, permission.value)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"missing permission {permission.value}",
+                headers={"WWW-Authenticate": f'Bearer error="insufficient_scope", scope="{permission.value}"'},
+            )
+        return principal
+
+    dependency.__name__ = f"require_audited_{permission.name.lower()}"
+    return dependency

@@ -13,6 +13,17 @@ Guarantees:
 - **Bounded execution.** Each event is bounded by client timeouts and bounded
   retries. The lease must exceed the worst-case sync duration (checked at
   startup). Batches are small, and the loop stops on signal after the current event.
+- **Safe processing deadline (M7).** The worker notes a monotonic timestamp
+  *before* claiming. The server's lease can't expire before
+  ``t_claim + lease``. Before every destination write the sync calls a guard
+  that refuses to write unless ``now + write_margin < t_claim + lease``, where
+  ``write_margin`` is the worst-case duration of one destination call. A
+  stalled worker (GC pause, suspended VM, slow lock wait) therefore never
+  writes after another worker could have reclaimed the event. Outcomes are
+  fenced by ``claim_token`` (M6).
+- **Retries (M7).** Retryable failures are rescheduled with bounded
+  exponential backoff with jitter. They go to ``dead_letter`` when attempts run
+  out. Permanent failures go to ``failed`` and are never retried automatically.
 """
 
 from __future__ import annotations
@@ -26,12 +37,13 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from app.core.config import Settings
+from app.core.config import RetrySettings, Settings
 from app.repositories.sync_history import RepositoryError
 from app.repositories.tenants import TenantRepository
 from app.repositories.webhook_events import ClaimedEvent, Outcome, PostgresWebhookEventRepository
 from app.schemas.sync import SyncStatus
-from app.services.account_sync import AccountSyncService, HistoryPersistenceError
+from app.services.account_sync import AccountSyncService, HistoryPersistenceError, OwnershipLost
+from app.worker.retry_policy import RetryPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +57,8 @@ class RunStats:
     claimed: int = 0
     succeeded: int = 0
     failed: int = 0
+    retried: int = 0
+    dead_lettered: int = 0
     lease_lost: int = 0
     completion_errors: int = 0
     claim_errors: int = 0
@@ -52,6 +66,12 @@ class RunStats:
 
 def default_worker_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
+
+
+def destination_write_margin(settings: Settings) -> float:
+    """Worst-case duration of ONE destination call (timeouts, in-client retries, backoff)."""
+    c = settings.internal
+    return (c.max_retries + 1) * c.timeout_seconds + c.max_retries * c.backoff_max_seconds
 
 
 def resolve_lease_seconds(settings: Settings) -> float:
@@ -72,7 +92,9 @@ class EventWorker:
     def __init__(self, *, events: PostgresWebhookEventRepository, service: AccountSyncService,
                  tenants: TenantRepository, lease_seconds: float, batch_size: int, max_attempts: int,
                  poll_interval: float, worker_id: str | None = None,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 retry_policy: RetryPolicy | None = None, write_margin_seconds: float = 0.0,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         self._events = events
         self._service = service
         self._tenants = tenants
@@ -84,6 +106,13 @@ class EventWorker:
         self._sleep = sleep
         self._stop = threading.Event()
         self.stats = RunStats()
+        self._retry = retry_policy or RetryPolicy(RetrySettings(), max_attempts)
+        self._margin = write_margin_seconds
+        self._clock = clock
+        self._deadline: float | None = None  # lease-derived deadline of the batch being processed
+        self._hostname = socket.gethostname()
+        if self._margin >= self._lease:
+            raise WorkerConfigurationError("lease must be longer than the destination write margin")
 
     def stop(self) -> None:
         self._stop.set()
@@ -91,6 +120,8 @@ class EventWorker:
     # ------------------------------------------------------------------ #
     def run_once(self) -> int:
         """Claim one batch and process it. Returns the number of events claimed."""
+        self._beat("idle")
+        claim_started = self._clock()  # taken BEFORE the claim: a conservative lease start
         try:
             claimed = self._events.claim(self.worker_id, batch=self._batch, lease_seconds=self._lease,
                                          max_attempts=self._max_attempts)
@@ -104,6 +135,7 @@ class EventWorker:
                 # Unprocessed claims keep their lease and are reclaimed after it expires.
                 logger.info("worker.stopping_with_claims worker=%s remaining_event=%s", self.worker_id, event.id)
                 break
+            self._deadline = claim_started + self._lease
             self._process(event)
         return len(claimed)
 
@@ -124,15 +156,35 @@ class EventWorker:
                     self._stop.wait(self._poll)
             except RepositoryError:
                 backoff = min(backoff * 2, 30.0)
+                self._beat("backing_off")
                 self._stop.wait(backoff)
+        self._beat("stopped")
         logger.info("worker.stopped worker=%s stats=%s", self.worker_id, self.stats)
         return self.stats
+
+    def _beat(self, state: str, current_event=None) -> None:
+        """Best-effort liveness record; never interrupts processing."""
+        try:
+            self._events.heartbeat(worker_id=self.worker_id, hostname=self._hostname, pid=os.getpid(),
+                                   state=state, current_event_id=current_event,
+                                   succeeded=self.stats.succeeded, failed=self.stats.failed + self.stats.dead_lettered)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("worker.heartbeat_failed worker=%s error=%s", self.worker_id, type(exc).__name__)
+
+    def _guard_for(self, deadline: float) -> Callable[[], None]:
+        def guard() -> None:
+            if self._clock() + self._margin >= deadline:
+                raise OwnershipLost("processing deadline reached: the event lease may have expired; "
+                                    "refusing to write to the destination")
+        return guard
 
     # ------------------------------------------------------------------ #
     def _process(self, event: ClaimedEvent) -> None:
         logger.info("worker.processing worker=%s event=%s tenant=%s account=%s attempt=%d",
                     self.worker_id, event.id, event.tenant_id, event.crm_account_id, event.attempts)
-        outcome = self._run_sync(event)
+        self._beat("processing", event.id)
+        deadline = self._deadline if self._deadline is not None else self._clock() + self._lease
+        outcome = self._decide(event, self._run_sync(event, self._guard_for(deadline)))
         try:
             recorded = self._events.complete(event, outcome)
         except RepositoryError as exc:
@@ -148,12 +200,27 @@ class EventWorker:
             return
         if outcome.status == "succeeded":
             self.stats.succeeded += 1
+        elif outcome.status == "pending":
+            self.stats.retried += 1
+        elif outcome.status == "dead_letter":
+            self.stats.dead_lettered += 1
         else:
             self.stats.failed += 1
-        logger.info("worker.completed worker=%s event=%s status=%s error=%s", self.worker_id, event.id,
-                    outcome.status, outcome.error_code or "-")
+        logger.info("worker.completed worker=%s event=%s status=%s error=%s retry_in=%s", self.worker_id,
+                    event.id, outcome.status, outcome.error_code or "-",
+                    f"{outcome.retry_delay_seconds:.1f}s" if outcome.retry_delay_seconds else "-")
 
-    def _run_sync(self, event: ClaimedEvent) -> Outcome:
+    def _decide(self, event: ClaimedEvent, raw: Outcome) -> Outcome:
+        decision = self._retry.decide(succeeded=raw.status == "succeeded", retryable=raw.error_retryable,
+                                      attempt=event.attempts)
+        if decision == "retry":
+            return Outcome("pending", raw.sync_record_id, raw.error_code, raw.error_message, True,
+                           retry_delay_seconds=self._retry.delay(event.attempts))
+        if decision == "dead_letter":
+            return Outcome("dead_letter", raw.sync_record_id, raw.error_code, raw.error_message, True)
+        return raw
+
+    def _run_sync(self, event: ClaimedEvent, guard: Callable[[], None] | None = None) -> Outcome:
         if not event.crm_account_id:
             return Outcome("failed", error_code="event_missing_account", error_message="event has no account id",
                            error_retryable=False)
@@ -166,7 +233,7 @@ class EventWorker:
                            error_message="tenant is suspended or no longer provisioned", error_retryable=False)
         try:
             # Same code path as POST /sync: mapping, tenant connections, advisory lock, history.
-            record = self._service.sync_account(event.tenant_id, event.crm_account_id)
+            record = self._service.sync_account(event.tenant_id, event.crm_account_id, guard=guard)
         except HistoryPersistenceError as exc:
             return Outcome("failed", error_code="history_not_persisted",
                            error_message=f"sync ran (status={exc.record.status.value}) but history was not saved",

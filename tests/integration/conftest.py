@@ -97,8 +97,12 @@ def pg_engine(pg_url):
     engine = build_engine(db_settings(pg_url), application_name="integrationlab-test")
     with engine.begin() as conn:
         # Guarded by the '_test' name check in pg_url.
-        conn.execute(text("TRUNCATE webhook_events, sync_records, tenant_mapping_configs, tenant_integrations, "
-                          "tenants RESTART IDENTITY"))
+        # audit_log is append-only (TRUNCATE blocked by trigger): disable the trigger for this
+        # test-database reset only, inside the same transaction.
+        conn.execute(text("ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_truncate"))
+        conn.execute(text("TRUNCATE audit_log, worker_heartbeats, webhook_event_attempts, webhook_events, "
+                          "sync_records, tenant_mapping_configs, tenant_integrations, tenants RESTART IDENTITY"))
+        conn.execute(text("ALTER TABLE audit_log ENABLE TRIGGER audit_log_no_truncate"))
         conn.execute(text("INSERT INTO tenants (id, display_name) VALUES " + ", ".join(
             f"('{t}', '{t}')" for t in TEST_TENANTS)))
     yield engine

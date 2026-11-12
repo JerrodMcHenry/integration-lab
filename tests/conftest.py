@@ -131,15 +131,23 @@ def tenant_repo():
 
 
 @pytest.fixture
-def auth(idp, tenant_repo):
-    """Install the test IdP's verifier and the test tenant directory on the app."""
+def audit_repo():
+    from app.repositories.audit import InMemoryAuditRepository
+    return InMemoryAuditRepository()
+
+
+@pytest.fixture
+def auth(idp, tenant_repo, audit_repo):
+    """Install the test IdP's verifier, the test tenant directory and an in-memory audit log."""
     from app.main import app
 
     verifier = idp.verifier()
     app.dependency_overrides[auth_deps.get_token_verifier] = lambda: verifier
     app.dependency_overrides[auth_deps.get_tenant_repository] = lambda: tenant_repo
     app.dependency_overrides[api_deps.get_tenant_repository] = lambda: tenant_repo
+    app.dependency_overrides[auth_deps.get_audit_repository] = lambda: audit_repo
+    app.dependency_overrides[api_deps.get_audit_repository] = lambda: audit_repo
     yield idp
     for dep in (auth_deps.get_token_verifier, auth_deps.get_tenant_repository,
-                api_deps.get_tenant_repository):
+                api_deps.get_tenant_repository, auth_deps.get_audit_repository, api_deps.get_audit_repository):
         app.dependency_overrides.pop(dep, None)

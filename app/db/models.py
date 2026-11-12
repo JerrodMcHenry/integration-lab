@@ -197,7 +197,8 @@ class SyncRecordRow(Base):
     )
 
 
-WEBHOOK_EVENT_STATUSES = ("pending", "processing", "succeeded", "failed", "ignored")
+WEBHOOK_EVENT_STATUSES = ("pending", "processing", "succeeded", "failed", "dead_letter", "ignored")
+TERMINAL_EVENT_STATUSES = ("succeeded", "failed", "dead_letter", "ignored")
 
 
 class WebhookEventRow(Base):
@@ -237,6 +238,10 @@ class WebhookEventRow(Base):
     last_error_retryable: Mapped[bool | None] = mapped_column(Boolean)
     sync_record_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("sync_records.id", ondelete="RESTRICT"))
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    replay_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    last_replayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_replayed_by: Mapped[str | None] = mapped_column(String(255))
 
     __table_args__ = (
         # Durable, tenant-scoped idempotency: one row per provider event per tenant.
@@ -249,9 +254,13 @@ class WebhookEventRow(Base):
         CheckConstraint("jsonb_typeof(payload) = 'object'", name="payload_is_object"),
         CheckConstraint("(status = 'processing') = (claim_token IS NOT NULL AND lease_expires_at IS NOT NULL)",
                         name="lease_iff_processing"),
-        CheckConstraint("status NOT IN ('succeeded', 'failed', 'ignored') OR processed_at IS NOT NULL",
-                        name="terminal_has_processed_at"),
-        CheckConstraint("status <> 'failed' OR last_error_code IS NOT NULL", name="failed_has_error"),
+        CheckConstraint(f"status NOT IN ({', '.join(repr(v) for v in TERMINAL_EVENT_STATUSES)}) "
+                        "OR processed_at IS NOT NULL", name="terminal_has_processed_at"),
+        CheckConstraint("status NOT IN ('failed', 'dead_letter') OR last_error_code IS NOT NULL",
+                        name="failed_has_error"),
+        CheckConstraint("replay_count >= 0", name="replay_count_non_negative"),
+        CheckConstraint("status <> 'dead_letter' OR dead_lettered_at IS NOT NULL",
+                        name="dead_letter_has_timestamp"),
         CheckConstraint(f"last_error_message IS NULL OR length(last_error_message) <= {ERROR_MESSAGE_MAX}",
                         name="error_message_length"),
         Index("ix_webhook_events_claimable", "available_at", "received_at",
@@ -259,4 +268,80 @@ class WebhookEventRow(Base):
         Index("ix_webhook_events_expired_leases", "lease_expires_at",
               postgresql_where=text("status = 'processing'")),
         Index("ix_webhook_events_tenant_recent", "tenant_id", text("received_at DESC")),
+    )
+
+
+ATTEMPT_OUTCOMES = ("succeeded", "retry_scheduled", "failed", "dead_letter", "lease_expired")
+
+
+class WebhookEventAttemptRow(Base):
+    """One row per processing attempt: the retry history of an event."""
+
+    __tablename__ = "webhook_event_attempts"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    event_uuid: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("webhook_events.id", ondelete="CASCADE"), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(
+        String(63), ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    retryable: Mapped[bool | None] = mapped_column(Boolean)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sync_record_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+
+    __table_args__ = (
+        CheckConstraint(_in("outcome", ATTEMPT_OUTCOMES), name="outcome_valid"),
+        CheckConstraint("attempt >= 1", name="attempt_positive"),
+        CheckConstraint(f"error_message IS NULL OR length(error_message) <= {ERROR_MESSAGE_MAX}",
+                        name="error_message_length"),
+        Index("ix_webhook_event_attempts_event", "event_uuid", "attempt"),
+        Index("ix_webhook_event_attempts_tenant_recent", "tenant_id", text("finished_at DESC")),
+    )
+
+
+class AuditLogRow(Base):
+    """Append-only record of sensitive operational actions (DB trigger blocks UPDATE/DELETE/TRUNCATE)."""
+
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    tenant_id: Mapped[str | None] = mapped_column(String(63), ForeignKey("tenants.id", ondelete="RESTRICT"))
+    actor: Mapped[str] = mapped_column(String(255), nullable=False)
+    actor_client_id: Mapped[str | None] = mapped_column(String(255))
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_type: Mapped[str | None] = mapped_column(String(64))
+    target_id: Mapped[str | None] = mapped_column(String(128))
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    details: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    __table_args__ = (
+        CheckConstraint("outcome IN ('success', 'denied', 'rejected', 'error')", name="outcome_valid"),
+        CheckConstraint(r"action ~ '^[a-z_]+(\.[a-z_]+)+$'", name="action_format"),
+        CheckConstraint("jsonb_typeof(details) = 'object'", name="details_is_object"),
+        Index("ix_audit_log_tenant_recent", "tenant_id", text("occurred_at DESC")),
+    )
+
+
+class WorkerHeartbeatRow(Base):
+    __tablename__ = "worker_heartbeats"
+
+    worker_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    hostname: Mapped[str] = mapped_column(String(255), nullable=False)
+    pid: Mapped[int] = mapped_column(Integer, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    events_succeeded: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    events_failed: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    current_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+
+    __table_args__ = (
+        CheckConstraint("state IN ('idle', 'processing', 'backing_off', 'stopped')", name="state_valid"),
     )

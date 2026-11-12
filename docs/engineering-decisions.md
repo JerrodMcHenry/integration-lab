@@ -271,3 +271,47 @@ replay failures, 403 for a suspended tenant, 413 for oversized bodies, 422
 for an authenticated but invalid payload, 503 for a store outage (sender retries).
 Unsupported event types are acknowledged and stored as `ignored`, so a provider
 doesn't retry them forever.
+
+## ED-031 — Retries reuse `pending` + `available_at` instead of a new status
+**Decision:** A scheduled retry is `pending` with a future `available_at` and
+`attempts > 0`. "Retry backlog" is a query, not a state.
+**Why:** The M6 claim query and indexes already handle it, which keeps the state
+machine small. `dead_letter` *is* a new state because it needs human action.
+
+## ED-032 — Equal-jitter exponential backoff, attempts include crash reclaims
+**Decision:** delay ∈ [c/2, c], c = min(cap, base·2^(n−1)). Every claim counts
+toward `WORKER_MAX_ATTEMPTS`, whether it ended in an error or a crash.
+**Why:** Full jitter can retry immediately; no jitter makes workers retry in
+lockstep. Counting crashes bounds poison messages that kill workers.
+
+## ED-033 — Safe processing deadline instead of lease renewal
+**Decision:** Keep the worst-case-bounded lease and add a monotonic,
+claim-anchored deadline checked before every destination write, with a margin
+covering one destination call.
+**Why:** Satisfies "no stale write after the lease could expire" with no extra
+thread or DB traffic. Renewal would let a stuck worker keep an event forever unless
+paired with a separate deadline anyway.
+**Tradeoff:** Very slow (but legitimate) syncs beyond the lease are aborted and
+retried, not extended. The startup check makes that impossible with the configured timeouts.
+
+## ED-034 — Replay uses `sync:run`; single-event and bounded bulk
+**Decision:** Replay needs `sync:run` (operators, admins). Bulk replay
+handles at most 100 events per call. Replay resets `attempts` to 0 (fresh
+budget), increments `replay_count`, and keeps the attempt history.
+**Why:** Replaying *is* triggering a sync. A separate permission would add
+policy surface without changing who can act. Bounded bulk prevents a single call
+from flooding the CRM after a long outage.
+
+## ED-035 — Audit log is append-only at the database level
+**Decision:** A trigger rejects UPDATE, DELETE and TRUNCATE on `audit_log`.
+Denied attempts on audited actions are recorded. Writes for replay share the
+action's transaction.
+**Why:** An audit trail the application could rewrite isn't evidence.
+Archiving requires a deliberate DBA action (disable the trigger), and the test
+fixtures do exactly that, only in the `_test` database.
+
+## ED-036 — Retention is opt-in, narrow and audited
+**Decision:** Dry-run by default. Execution needs both a flag and an env
+switch. Only terminal-success/ignored events and unreferenced sync records are eligible.
+**Why:** The user's constraint (no destructive cleanup without approval), and
+failed/dead-lettered events are exactly the ones operators still need.

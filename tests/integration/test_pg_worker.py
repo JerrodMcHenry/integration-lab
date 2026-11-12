@@ -73,7 +73,9 @@ def test_retryable_upstream_failure_is_marked_retryable(pg_engine, world, servic
     [eid] = ingest_direct(pg_engine, 1)
     build_worker(pg_engine, service).run_once()
     ev = by_id(pg_engine)[eid]
-    assert (ev["status"], ev["last_error_code"], ev["last_error_retryable"]) == ("failed", "crm_unavailable", True)
+    # M7: a retryable failure is rescheduled (pending, future available_at) instead of terminal 'failed'.
+    assert (ev["status"], ev["last_error_code"], ev["last_error_retryable"]) == ("pending", "crm_unavailable", True)
+    assert ev["available_at"] > ev["received_at"] and ev["processed_at"] is None
 
 
 def test_tenant_isolation_in_worker(pg_engine, world, service):
@@ -216,7 +218,9 @@ def test_crash_loop_is_bounded_by_max_attempts(pg_engine, world, service):
         time.sleep(1.1)
     assert build_worker(pg_engine, service, max_attempts=2).run_once() == 0
     ev = by_id(pg_engine)[eid]
-    assert (ev["status"], ev["last_error_code"], ev["attempts"]) == ("failed", "worker_attempts_exhausted", 2)
+    # M7: exhausted claims go to the dead-letter state (M6: terminal 'failed').
+    assert (ev["status"], ev["last_error_code"], ev["attempts"]) == ("dead_letter", "worker_attempts_exhausted", 2)
+    assert ev["dead_lettered_at"] is not None
     assert ev["last_error_retryable"] is False
 
 
@@ -294,8 +298,10 @@ def test_history_write_failure_is_recorded_as_retryable(pg_engine, world, dead_e
     [eid] = ingest_direct(pg_engine, 1)
     build_worker(pg_engine, svc).run_once()
     ev = by_id(pg_engine)[eid]
+    # M7: retryable -> rescheduled (M6: terminal 'failed').
     assert (ev["status"], ev["last_error_code"], ev["last_error_retryable"]) == (
-        "failed", "history_not_persisted", True)
+        "pending", "history_not_persisted", True)
+    assert ev["available_at"] > ev["received_at"]
 
 
 # --------------------------------------------------------------------------- #

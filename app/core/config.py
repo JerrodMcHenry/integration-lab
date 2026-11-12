@@ -170,6 +170,36 @@ class WorkerSettings:
 
 
 @dataclass(frozen=True)
+class RetrySettings:
+    #: Delay before retry n is drawn from [d/2, d] where d = min(max_delay, base * 2^(n-1)).
+    base_delay_seconds: float = 5.0
+    max_delay_seconds: float = 300.0
+
+    def __post_init__(self) -> None:
+        if not 0.1 <= self.base_delay_seconds <= 600:
+            raise ValueError("RETRY_BASE_DELAY_SECONDS must be between 0.1 and 600")
+        if not self.base_delay_seconds <= self.max_delay_seconds <= 86400:
+            raise ValueError("RETRY_MAX_DELAY_SECONDS must be >= the base delay and <= 86400")
+
+
+@dataclass(frozen=True)
+class RetentionSettings:
+    #: Destructive cleanup is OFF unless explicitly enabled; even then the CLI needs --execute.
+    enabled: bool = False
+    succeeded_event_days: int = 30
+    ignored_event_days: int = 7
+    sync_record_days: int = 90
+    batch_size: int = 1000
+
+    def __post_init__(self) -> None:
+        for name in ("succeeded_event_days", "ignored_event_days", "sync_record_days"):
+            if not 1 <= getattr(self, name) <= 3650:
+                raise ValueError(f"RETENTION_{name.upper()} must be between 1 and 3650")
+        if not 10 <= self.batch_size <= 10_000:
+            raise ValueError("RETENTION_BATCH_SIZE must be between 10 and 10000")
+
+
+@dataclass(frozen=True)
 class Settings:
     environment: str
     crm: CRMSettings
@@ -178,6 +208,10 @@ class Settings:
     oidc: OIDCSettings
     webhooks: WebhookSettings
     worker: WorkerSettings
+    retry: RetrySettings
+    retention: RetentionSettings
+    #: Bearer token for the platform-wide Prometheus endpoint. Unset = endpoint disabled.
+    metrics_token: str | None
     mapping_config_dir: Path
     #: Tenant used only by the database-less development fallback.
     default_tenant_id: str
@@ -195,6 +229,8 @@ class Settings:
                 problems.append("OIDC_ISSUER must use https in production")
             if self.oidc.issuer.rstrip("/") == DEV_OIDC_ISSUER:
                 problems.append("OIDC_ISSUER points at the development mock IdP")
+            if self.metrics_token is not None and len(self.metrics_token) < 32:
+                problems.append("METRICS_TOKEN must be at least 32 characters in production")
             if self.oidc.jwks_url and not self.oidc.jwks_url.startswith("https://"):
                 problems.append("OIDC_JWKS_URL must use https in production")
             if self.crm.client_secret == DEV_CRM_CLIENT_SECRET:
@@ -263,6 +299,18 @@ def load_settings() -> Settings:
             lease_seconds=_env_float("WORKER_LEASE_SECONDS", 0) or None,
             max_attempts=_env_int("WORKER_MAX_ATTEMPTS", 5),
         ),
+        retry=RetrySettings(
+            base_delay_seconds=_env_float("RETRY_BASE_DELAY_SECONDS", 5.0),
+            max_delay_seconds=_env_float("RETRY_MAX_DELAY_SECONDS", 300.0),
+        ),
+        retention=RetentionSettings(
+            enabled=os.getenv("RETENTION_ENABLED", "false").strip().lower() in ("1", "true", "yes"),
+            succeeded_event_days=_env_int("RETENTION_SUCCEEDED_EVENT_DAYS", 30),
+            ignored_event_days=_env_int("RETENTION_IGNORED_EVENT_DAYS", 7),
+            sync_record_days=_env_int("RETENTION_SYNC_RECORD_DAYS", 90),
+            batch_size=_env_int("RETENTION_BATCH_SIZE", 1000),
+        ),
+        metrics_token=os.getenv("METRICS_TOKEN") or None,
         mapping_config_dir=Path(
             os.getenv("MAPPING_CONFIG_DIR", Path(__file__).resolve().parent.parent / "mapping" / "configs")
         ),

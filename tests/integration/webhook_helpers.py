@@ -73,10 +73,10 @@ def build_service(engine, http_client_factory=None, secrets=None) -> AccountSync
         locks=PostgresAdvisorySyncLocks(engine, lock_timeout_seconds=30))
 
 
-def build_worker(engine, service, *, lease=30.0, max_attempts=5, batch=5, worker_id=None) -> EventWorker:
+def build_worker(engine, service, *, lease=30.0, max_attempts=5, batch=5, worker_id=None, **kw) -> EventWorker:
     return EventWorker(events=PostgresWebhookEventRepository(engine), service=service,
                        tenants=PostgresTenantRepository(engine), lease_seconds=lease, batch_size=batch,
-                       max_attempts=max_attempts, poll_interval=0.05, worker_id=worker_id)
+                       max_attempts=max_attempts, poll_interval=0.05, worker_id=worker_id, **kw)
 
 
 def events(engine, tenant=None) -> list[dict]:

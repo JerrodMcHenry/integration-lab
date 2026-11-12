@@ -80,8 +80,14 @@ docker compose exec db psql -U integrationlab -d integrationlab -c "select * fro
 | 503 from the webhook endpoint | DB unreachable. The event was **not** stored; the sender must retry |
 | events stay `pending` | no worker running (`docker compose ps worker`), or the worker can't reach the DB (logs `worker.claim_failed`, backing off) |
 | events stuck `processing` | a worker died mid-event. They're reclaimed automatically when `lease_expires_at` passes (default ≈ 214 s) |
-| `failed / worker_attempts_exhausted` | the event was claimed `WORKER_MAX_ATTEMPTS` times without completing (repeated crashes). Investigate worker logs. Replay arrives in M7 |
-| `failed / history_not_persisted` | sync ran but its record couldn't be saved (DB issue). Retryable |
+| `dead_letter / worker_attempts_exhausted` | claimed `WORKER_MAX_ATTEMPTS` times without completing (repeated crashes). Check worker logs, then replay |
+| `dead_letter / destination_unavailable` (or another retryable code) | retries exhausted during an outage. Replay once it's resolved |
+| `failed / crm_not_found`, `mapping_failed`, … | permanent: fix the data or mapping, then replay |
+| `pending` with `attempts > 0` | a scheduled retry. `available_at` shows when (`/attempts` has `next_attempt_at`) |
+| `sync_lock_lost` / `processing_deadline_exceeded` | the ownership check refused a destination write (lock session lost, or the worker stalled near its lease). Retried automatically |
+| replay → 409 | only `failed` and `dead_letter` can be replayed |
+| replay → 403 | needs operator or admin (`sync:run`). The attempt is in the audit log |
+| `/metrics` → 404 | `METRICS_TOKEN` not set (disabled by design) |
 | uneven work across workers | one worker claimed a whole batch. Lower `WORKER_BATCH_SIZE` |
 
 ```bash
@@ -95,4 +101,16 @@ docker compose exec db psql -U integrationlab -d integrationlab -c \
 docker compose exec db psql -U integrationlab -d integrationlab -c \
   "select event_id, crm_account_id, last_error_code, last_error_retryable from webhook_events where status='failed' order by received_at desc limit 20"
 docker compose logs -f worker
+```
+
+```bash
+# Dead letters and retry backlog per tenant
+docker compose exec db psql -U integrationlab -d integrationlab -c \
+  "select tenant_id, count(*) filter (where status='dead_letter') dead, count(*) filter (where status='pending' and attempts>0) retrying from webhook_events group by 1"
+# Attempt history for one event
+docker compose exec db psql -U integrationlab -d integrationlab -c \
+  "select attempt, outcome, error_code, next_attempt_at from webhook_event_attempts where event_uuid='<uuid>' order by id"
+# Worker liveness
+docker compose exec db psql -U integrationlab -d integrationlab -c \
+  "select worker_id, state, last_seen_at, events_succeeded, events_failed from worker_heartbeats order by last_seen_at desc"
 ```

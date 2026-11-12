@@ -8,7 +8,7 @@ IntegrationLab synchronizes customer account records for **Meridian Capital**
 from a Salesforce-style CRM into Meridian's internal Customer Management
 System (CMS). Both external systems are simulated by separate mock services.
 
-## Current state (Milestone 6 complete)
+## Current state (Milestone 7 complete)
 
 ```
                      ┌──────────────────────────── IntegrationLab (FastAPI :8000) ───────────────────────────┐
@@ -51,7 +51,11 @@ System (CMS). Both external systems are simulated by separate mock services.
 | Durable event inbox | `app/repositories/webhook_events.py`, migration `0004` | ✅ |
 | Background worker (SKIP LOCKED claiming, leases) | `app/worker/` | ✅ |
 | Mock CRM / mock CMS / admin guard | `mock_crm/`, `mock_internal/`, `mock_common/` | ✅ |
-| Automatic retries with backoff, dead-letter, manual replay | — | 🚧 M7 |
+| Automatic retries (bounded exponential backoff + jitter), dead-letter, manual replay | `app/worker/retry_policy.py`, `app/api/webhooks.py` | ✅ |
+| Attempt history, audit log, worker heartbeats | migration `0005` | ✅ |
+| Lock-ownership verification + processing deadline before destination writes | `app/services/account_sync.py` (`_WriteGate`) | ✅ (limitations below) |
+| Operational metrics (tenant JSON + platform Prometheus) | `app/api/ops.py` | ✅ |
+| Retention policy (dry-run by default) | `app/retention.py`, `python -m app.cli retention` | ✅ |
 | React monitoring dashboard | — | 🚧 M8 |
 
 ## Separation of responsibilities
@@ -283,8 +287,22 @@ Not recommended: a fencing-token table in our own database. It can stop a stale
 worker writing *history*, but not writing the *destination*, which is where
 the damage happens.
 
-**Plan:** implement 1 and 3 in Milestone 7 (failure recovery), where the
-worker loop already handles retryable outcomes. Implement 2 when the
+**Status after Milestone 7:** measure 1 is **implemented**
+(`_PgLockHandle.verify()` runs immediately before each destination create or
+update, and the sync fails with retryable `sync_lock_lost` without writing).
+A worker-side processing deadline guards the same points (see below).
+Measure 3 is partly implemented (`expired_leases` metric, `lease_expired`
+attempt rows, `sync_lock_lost` / `processing_deadline_exceeded` error codes).
+Measure 2 (destination fencing) is **not** implemented: the mock CMS has no
+version/ETag support.
+
+**Remaining limitation:** both checks run *immediately before* the HTTP write.
+A lock or lease lost *during* the write itself (milliseconds to the client
+timeout) isn't detected, and a stale worker could still complete that one
+in-flight write. Its *outcome* can't overwrite the newer one (claim-token
+fencing), and the sync is idempotent, so the realistic effect is a redundant
+write with the same CRM-owned values. Only destination-side conditional writes
+(measure 2) close this window completely. Implement 2 when the
 destination supports conditional writes (most production APIs, including
 Salesforce, expose ETags or version fields). With 2 in place the lock is purely
 a performance optimisation and correctness no longer depends on it.
@@ -367,3 +385,84 @@ A processing failure is currently a terminal `failed` with
 
 The claim query already honours `available_at`. No schema change is needed
 beyond widening the status CHECK.
+
+## Retries, dead-letter and recovery (Milestone 7)
+
+```
+                 retryable & attempts < max: available_at = now + backoff(attempts)
+            ┌───────────────────────────────────────────────────────────────┐
+            ▼                                                               │
+ pending ──claim──▶ processing ──complete──┬──▶ succeeded                    │
+   ▲                    │                  ├──▶ failed       (permanent: never auto-retried)
+   │                    │                  ├──▶ pending ─────────────────────┘
+   │                    │                  └──▶ dead_letter  (retryable but attempts exhausted)
+   │                    └── lease expired: reclaimed (attempt logged 'lease_expired');
+   │                        at max attempts → dead_letter
+   └──── POST /webhooks/events/{id}/replay (sync:run, audited): failed|dead_letter → pending, attempts = 0
+```
+
+**Retry policy** (`app/worker/retry_policy.py`):
+
+| Outcome | attempts < `WORKER_MAX_ATTEMPTS` | attempts ≥ max |
+|---|---|---|
+| success | `succeeded` | `succeeded` |
+| retryable failure (timeouts, 5xx/429, lock timeout/lost, deadline, history write) | `pending`, `available_at = now + delay` | `dead_letter` |
+| permanent failure (not found, auth, mapping, 4xx, tenant inactive) | `failed` | `failed` |
+
+`delay` for attempt *n* is uniform in `[c/2, c]` where `c = min(RETRY_MAX_DELAY_SECONDS,
+RETRY_BASE_DELAY_SECONDS × 2^(n−1))` ("equal jitter": decorrelates workers,
+guarantees minimum spacing, bounded). Defaults: base 5 s, cap 300 s, 5
+attempts, giving a worst case of about 75 s of retry time before dead-letter. Crash
+reclaims count as attempts too. The claim query was unchanged from M6: it already
+honoured `available_at`.
+
+**Completion writes the outcome and the attempt row in one statement**
+(data-modifying CTE), fenced by `claim_token`. A stale worker's completion
+matches no row, so neither its outcome nor its attempt record is stored.
+
+**Safe processing deadline (req. 6).** The lease is ≥ the worst-case event
+duration (M6 startup check). The worker records a monotonic time *before*
+claiming, which is never later than the server's lease start. The guard passed into
+the sync refuses any destination write once `now + write_margin ≥ t_claim + lease`,
+where `write_margin` is the worst case of one destination call
+(`(retries+1) × timeout + retries × backoff_cap`, 6 s with defaults). So a
+stalled worker (GC pause, suspended VM, long lock wait) never *starts* a
+write after another worker could have reclaimed the event. Lease *renewal*
+wasn't added: with the worst-case-bounded lease it would only add moving parts.
+
+**Lock-ownership verification (req. 7):** see "Concurrency lock: lost-lock mitigation" above.
+
+### New tables (migration `0005`)
+
+| Table | Purpose |
+|---|---|
+| `webhook_events` (+ columns) | status `dead_letter`; `dead_lettered_at`, `replay_count`, `last_replayed_at`, `last_replayed_by`. CHECKs: dead_letter needs a timestamp and an error |
+| `webhook_event_attempts` | one row per attempt: number, worker, start/finish, outcome (`succeeded`, `retry_scheduled`, `failed`, `dead_letter`, `lease_expired`), error code/message/retryable, `next_attempt_at`, `sync_record_id`. Cascades with its event |
+| `audit_log` | append-only: a trigger blocks UPDATE, DELETE and TRUNCATE. actor (token `sub` or `cli:<user>`), client id, tenant, action, target, outcome (`success`/`denied`/`rejected`/`error`), details (no secrets: forbidden keys rejected) |
+| `worker_heartbeats` | worker id, host, pid, state (`idle`/`processing`/`backing_off`/`stopped`), last_seen, counters |
+
+Audited actions: `webhook_event.replay` (success, rejected and **denied**),
+`webhook_event.replay_bulk` (denied), `mapping.publish` (success, rejected,
+denied) and `retention.purge`. Audit rows for replay are written in the same
+transaction as the state change. Each record is also logged as one JSON line
+(`integrationlab.audit`).
+
+### Metrics
+
+| Endpoint | Audience | Content |
+|---|---|---|
+| `GET /ops/metrics` | tenant users (`history:read`) | own tenant: pending, ready, retry_backlog, processing, expired_leases, failed, dead_letter, succeeded_1h, oldest pending age, p50/p95/max receive→success latency (1 h). Worker health as counts only |
+| `GET /metrics` | platform (separate `METRICS_TOKEN`, disabled if unset) | Prometheus text, all tenants (`tenant` label), healthy workers |
+
+A worker is healthy if its heartbeat is newer than the lease (it writes one
+before every claim and when it starts each event).
+
+### Retention (`python -m app.cli retention [--execute]`)
+
+Deletes only `succeeded` events older than 30 d, `ignored` events older than
+7 d, and sync records older than 90 d that no event references. Never:
+pending/processing/failed/dead_letter events, the audit log, tenants or
+configuration. Dry-run by default. `--execute` additionally requires
+`RETENTION_ENABLED=true` (default false). Batches of 1000 in separate short
+transactions with `SKIP LOCKED`. One audit record per tenant per run. **It has
+not been executed against the development database.**

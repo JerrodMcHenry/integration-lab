@@ -16,7 +16,8 @@ from app.api.deps import get_engine, get_sync_service, get_tenant_repository
 from app.core.config import get_settings
 from app.repositories.sync_history import RepositoryError
 from app.repositories.webhook_events import PostgresWebhookEventRepository
-from app.worker.runner import EventWorker, WorkerConfigurationError, resolve_lease_seconds
+from app.worker.retry_policy import RetryPolicy
+from app.worker.runner import EventWorker, WorkerConfigurationError, destination_write_margin, resolve_lease_seconds
 
 
 def build_worker(worker_id: str | None = None) -> EventWorker:
@@ -27,7 +28,9 @@ def build_worker(worker_id: str | None = None) -> EventWorker:
     return EventWorker(events=PostgresWebhookEventRepository(engine), service=get_sync_service(),
                        tenants=get_tenant_repository(), lease_seconds=resolve_lease_seconds(settings),
                        batch_size=settings.worker.batch_size, max_attempts=settings.worker.max_attempts,
-                       poll_interval=settings.worker.poll_interval_seconds, worker_id=worker_id)
+                       poll_interval=settings.worker.poll_interval_seconds, worker_id=worker_id,
+                       retry_policy=RetryPolicy(settings.retry, settings.worker.max_attempts),
+                       write_margin_seconds=destination_write_margin(settings))
 
 
 def main(argv: list[str] | None = None) -> int:

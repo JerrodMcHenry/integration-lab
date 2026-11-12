@@ -214,10 +214,43 @@ docker compose up -d --scale worker=4     # more workers; SKIP LOCKED shares the
 | `WORKER_BATCH_SIZE` | 10 | events claimed per round trip (lower = fairer spread across workers) |
 | `WORKER_POLL_INTERVAL_SECONDS` | 1 | idle poll interval |
 | `WORKER_LEASE_SECONDS` | 2 × worst case (≈ 214 s) | claim reservation. The worker refuses a value below the worst-case event duration |
-| `WORKER_MAX_ATTEMPTS` | 5 | claims per event before it is failed (`worker_attempts_exhausted`) |
+| `WORKER_MAX_ATTEMPTS` | 5 | attempts (incl. crash reclaims) before `dead_letter` |
+| `RETRY_BASE_DELAY_SECONDS` | 5 | backoff ceiling for retry *n* = min(cap, base·2^(n−1)); delay ∈ [ceiling/2, ceiling] |
+| `RETRY_MAX_DELAY_SECONDS` | 300 | backoff cap |
+| `METRICS_TOKEN` | unset (disabled) | bearer token for platform `/metrics` |
+| `RETENTION_ENABLED` | false | must be true for `retention --execute` to delete |
+| `RETENTION_SUCCEEDED_EVENT_DAYS` / `_IGNORED_EVENT_DAYS` / `_SYNC_RECORD_DAYS` | 30 / 7 / 90 | retention windows |
 | `WEBHOOK_TOLERANCE_SECONDS` | 300 | replay window |
 | `WEBHOOK_MAX_BODY_BYTES` | 65536 | |
 
 The mock CRMs send webhooks automatically on `PATCH /crm/accounts/{id}`.
 `GET /_admin/webhooks` shows deliveries and
 `POST /_admin/webhooks/redeliver/{event_id}` resends one (dev only).
+
+
+## Recovering from failures (Milestone 7)
+
+1. **Transient errors** (CRM/CMS timeouts, 5xx, 429, lock contention) retry
+   automatically with backoff. Nothing to do.
+2. Events that still fail after `WORKER_MAX_ATTEMPTS` land in **`dead_letter`**.
+   Permanent errors (unknown account, mapping errors, auth) land in **`failed`**
+   right away.
+3. Find them: `GET /webhooks/events?status=dead_letter` (or `failed`). Inspect
+   `GET /webhooks/events/{id}/attempts` for the per-attempt errors.
+4. Fix the cause (outage over, CRM data corrected, mapping published), then replay:
+   ```bash
+   curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" -H 'Content-Type: application/json' \
+     -d '{"reason":"INC-4711 resolved"}' localhost:8000/webhooks/events/<id>/replay
+   # or, after a broad outage (max 100 per call):
+   curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" -H 'Content-Type: application/json' \
+     -d '{"statuses":["dead_letter"],"limit":100,"reason":"CMS outage"}' localhost:8000/webhooks/events/replay
+   ```
+5. Replays are idempotent (the sync re-reads the CRM and only writes changes)
+   and recorded in `GET /admin/audit`.
+
+## Retention
+
+```bash
+python -m app.cli retention                       # dry run: counts what the policy would delete
+RETENTION_ENABLED=true python -m app.cli retention --execute   # deletes (audited); needs approval
+```

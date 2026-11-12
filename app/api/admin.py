@@ -12,11 +12,12 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
-from app.api.deps import get_tenant_repository
-from app.auth.dependencies import get_principal, require
+from app.api.deps import get_audit_repository, get_tenant_repository
+from app.auth.dependencies import get_principal, require, require_audited
 from app.auth.permissions import Permission
 from app.auth.tokens import Principal
 from app.mapping.mapper import FieldMapper, MappingConfigError
+from app.repositories.audit import AuditEntry, AuditRepository
 from app.repositories.tenants import MappingVersionConflict, TenantRepository
 
 router = APIRouter(tags=["identity & administration"])
@@ -108,20 +109,31 @@ def mapping_versions(principal: Annotated[Principal, Depends(require(Permission.
             summary="Publish a new mapping version (requires config:write)",
             responses={409: {"description": "Concurrent publish; retry"},
                        422: {"description": "Invalid mapping, or tenant_id doesn't match the caller"}})
-def publish_mapping(principal: Annotated[Principal, Depends(require(Permission.CONFIG_WRITE))],
+def publish_mapping(principal: Annotated[Principal, Depends(require_audited(Permission.CONFIG_WRITE,
+                                                                          "mapping.publish"))],
                     repo: Annotated[TenantRepository, Depends(get_tenant_repository)],
+                    audit: Annotated[AuditRepository, Depends(get_audit_repository)],
                     config: Annotated[dict[str, Any], Body(max_length=100)]):
+    def record(outcome: str, **details):
+        audit.record(AuditEntry(actor=principal.subject, actor_client_id=principal.client_id,
+                                tenant_id=principal.tenant_id, action="mapping.publish", outcome=outcome,
+                                target_type="mapping", details=details))
+
     if config.get("tenant_id") != principal.tenant_id:
         # Reject rather than silently rewrite: a mismatch indicates a mistake or an attack.
+        record("rejected", reason="tenant_id mismatch")
         raise HTTPException(status_code=422, detail="mapping tenant_id must match your tenant")
     candidate = {**config, "version": 1}  # the server assigns the real version
     try:
         FieldMapper.from_dict(candidate)
     except MappingConfigError as exc:
+        record("rejected", reason="invalid mapping", problems=len(exc.problems))
         raise HTTPException(status_code=422, detail={"problems": exc.problems}) from exc
     try:
         stored = repo.add_mapping_version(principal.tenant_id, candidate, principal.subject)
     except MappingVersionConflict as exc:
+        record("rejected", reason="concurrent publish")
         raise HTTPException(status_code=409, detail="another mapping version was published concurrently") from exc
+    record("success", version=stored.version, fields=len(candidate.get("fields", [])))
     return MappingVersionResponse(version=stored.version, created_by=stored.created_by,
                                   created_at=stored.created_at, config=stored.config)
