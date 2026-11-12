@@ -15,8 +15,9 @@ which causes drift and delays onboarding.
 | R4 | Meridian's industry taxonomy differs from Salesforce's | ✅ `value_map` in `meridian.json` |
 | R5 | Revenue stored as exact decimal USD | ✅ `to_decimal(places=2)` |
 | R6 | Records with missing mandatory data must not be loaded, and the reason must be visible | ✅ `transform` failures with per-field issues |
-| R7 | Outages in either system must be visible and recoverable | ✅ visible in results/history. Automatic job retry 🚧 M7 |
-| R8 | No duplicate customers from repeated or concurrent syncs | ✅ idempotent create + diff (single process). Multi-process 🚧 M4 |
+| R7 | Outages in either system must be visible and recoverable | ✅ visible in results and durable history. Automatic job retry 🚧 M7 |
+| R7a | Sync history must survive restarts and must not contain client data | ✅ PostgreSQL, identifiers and field names only |
+| R8 | No duplicate customers from repeated or concurrent syncs | ✅ idempotent create + diff + PostgreSQL advisory lock across processes |
 | R9 | Client data must not appear in operational logs | ✅ tested |
 | R10 | Access restricted to authorized Meridian users, isolated from other tenants | 🚧 M5 |
 | R11 | Operational dashboard for integration health | 🚧 M8 |

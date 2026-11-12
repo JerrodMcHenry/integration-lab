@@ -13,7 +13,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -31,6 +30,7 @@ from app.schemas.internal_customer import (
     CustomerSyncPayload,
 )
 from app.schemas.sync import SyncErrorDetail, SyncRecord, SyncStage, SyncStatus
+from app.services.locks import InProcessSyncLocks, LockError, SyncLockProvider
 
 logger = logging.getLogger(__name__)
 
@@ -50,18 +50,16 @@ class _SyncFailure(Exception):
         self.error = error
 
 
-class _StripedLocks:
-    """Serializes concurrent syncs of the same account within this process.
+class HistoryPersistenceError(RuntimeError):
+    """The sync ran but its record could not be saved.
 
-    Uses a fixed number of locks so memory stays bounded. Cross-process
-    serialization needs a database lock (Milestone 4).
+    The full record (identifiers only, no account data) is logged at ERROR
+    level and attached here, so it isn't lost and callers can report it.
     """
 
-    def __init__(self, stripes: int = 64) -> None:
-        self._locks = [threading.Lock() for _ in range(stripes)]
-
-    def for_key(self, key: str) -> threading.Lock:
-        return self._locks[hash(key) % len(self._locks)]
+    def __init__(self, record: SyncRecord) -> None:
+        super().__init__(f"sync history not persisted for record {record.id}")
+        self.record = record
 
 
 class AccountSyncService:
@@ -72,33 +70,59 @@ class AccountSyncService:
         destination: InternalSystemClient,
         mappings: MappingRegistry,
         history: SyncHistoryRepository,
+        locks: SyncLockProvider | None = None,
     ) -> None:
         self._crm = crm
         self._destination = destination
         self._mappings = mappings
         self._history = history
-        self._locks = _StripedLocks()
+        self._locks: SyncLockProvider = locks or InProcessSyncLocks()
 
     # ------------------------------------------------------------------ #
     def sync_account(self, tenant_id: str, crm_account_id: str) -> SyncRecord:
+        """Run one sync and persist its record.
+
+        Raises ``HistoryPersistenceError`` only if the record can't be saved.
+        Every other outcome is returned as a ``SyncRecord``.
+        """
         started_at = datetime.now(timezone.utc)
         t0 = time.monotonic()
+        try:
+            with self._locks.hold(tenant_id, crm_account_id):
+                record = self._execute(tenant_id, crm_account_id, started_at, t0)
+                # Persist while still holding the lock so history order matches sync order.
+                self._persist(record)
+                return record
+        except LockError as exc:
+            record = self._build(
+                tenant_id, crm_account_id, started_at, t0, SyncStatus.FAILED, {}, {},
+                SyncStage.ACQUIRE_LOCK,
+                SyncErrorDetail(code=exc.code, message=str(exc), retryable=exc.retryable),
+            )
+            self._persist(record)
+            return record
+
+    def _execute(self, tenant_id: str, crm_account_id: str, started_at: datetime,
+                 t0: float) -> SyncRecord:
         ctx: dict[str, Any] = {}
+        try:
+            status, extra = self._run(tenant_id, crm_account_id, ctx)
+            stage, error = None, None
+        except _SyncFailure as failure:
+            status, extra, stage, error = SyncStatus.FAILED, {}, failure.stage, failure.error
+        except Exception:  # noqa: BLE001 - recorded and logged, never silent
+            logger.exception("sync.unexpected_error tenant=%s account=%s", tenant_id, crm_account_id)
+            status, extra, stage = SyncStatus.FAILED, {}, SyncStage.INTERNAL
+            error = SyncErrorDetail(code="unexpected_error",
+                                    message="Unexpected internal error; see service logs",
+                                    retryable=False)
+        return self._build(tenant_id, crm_account_id, started_at, t0, status, extra, ctx, stage, error)
 
-        with self._locks.for_key(f"{tenant_id}:{crm_account_id}"):
-            try:
-                status, extra = self._run(tenant_id, crm_account_id, ctx)
-                stage, error = None, None
-            except _SyncFailure as failure:
-                status, extra, stage, error = SyncStatus.FAILED, {}, failure.stage, failure.error
-            except Exception:  # noqa: BLE001 - recorded and logged, never silent
-                logger.exception("sync.unexpected_error tenant=%s account=%s", tenant_id, crm_account_id)
-                status, extra, stage = SyncStatus.FAILED, {}, SyncStage.INTERNAL
-                error = SyncErrorDetail(code="unexpected_error",
-                                        message="Unexpected internal error; see service logs",
-                                        retryable=False)
-
-        record = SyncRecord(
+    @staticmethod
+    def _build(tenant_id: str, crm_account_id: str, started_at: datetime, t0: float,
+               status: SyncStatus, extra: dict, ctx: dict, stage: SyncStage | None,
+               error: SyncErrorDetail | None) -> SyncRecord:
+        return SyncRecord(
             tenant_id=tenant_id,
             crm_account_id=crm_account_id,
             status=status,
@@ -112,12 +136,21 @@ class AccountSyncService:
             finished_at=datetime.now(timezone.utc),
             duration_ms=int((time.monotonic() - t0) * 1000),
         )
-        self._history.add(record)
-        log = logger.warning if status is SyncStatus.FAILED else logger.info
+
+    def _persist(self, record: SyncRecord) -> None:
+        try:
+            self._history.add(record)
+        except Exception as exc:
+            # Never lose an outcome silently: the record has no account data, so log it in full.
+            logger.error("sync.history_write_failed error=%s record=%s",
+                         type(exc).__name__, record.model_dump_json())
+            raise HistoryPersistenceError(record) from exc
+        stage, error = record.stage, record.error
+        log = logger.warning if record.status is SyncStatus.FAILED else logger.info
         log("sync.completed tenant=%s account=%s status=%s stage=%s error=%s fields=%s duration_ms=%d",
-            tenant_id, crm_account_id, status.value, stage.value if stage else "-",
-            error.code if error else "-", ",".join(record.fields_changed) or "-", record.duration_ms)
-        return record
+            record.tenant_id, record.crm_account_id, record.status.value,
+            stage.value if stage else "-", error.code if error else "-",
+            ",".join(record.fields_changed) or "-", record.duration_ms)
 
     # ------------------------------------------------------------------ #
     def _run(self, tenant_id: str, crm_account_id: str, ctx: dict[str, Any]) -> tuple[SyncStatus, dict]:

@@ -78,10 +78,34 @@ class InternalSystemSettings:
 
 
 @dataclass(frozen=True)
+class DatabaseSettings:
+    #: SQLAlchemy URL, e.g. postgresql+psycopg://user:pass@host:5432/db. ``None``
+    #: selects in-memory storage (development/test only).
+    url: str | None
+    pool_size: int = 10
+    max_overflow: int = 10
+    pool_timeout_seconds: float = 5.0
+    connect_timeout_seconds: int = 3
+    #: Max time to wait for another worker's sync of the same account.
+    lock_timeout_seconds: float = 10.0
+
+    def __post_init__(self) -> None:
+        if self.url is not None and not self.url.startswith("postgresql"):
+            raise ValueError("DATABASE_URL must be a PostgreSQL URL")
+        if self.pool_size < 1 or self.max_overflow < 0:
+            raise ValueError("DB_POOL_SIZE must be >= 1 and DB_MAX_OVERFLOW >= 0")
+        if not 0 < self.lock_timeout_seconds <= 300:
+            raise ValueError("SYNC_LOCK_TIMEOUT_SECONDS must be in (0, 300]")
+        if self.connect_timeout_seconds < 1:
+            raise ValueError("DB_CONNECT_TIMEOUT_SECONDS must be >= 1")
+
+
+@dataclass(frozen=True)
 class Settings:
     environment: str
     crm: CRMSettings
     internal: InternalSystemSettings
+    database: DatabaseSettings
     mapping_config_dir: Path
     #: Single-tenant placeholder until authentication lands in Milestone 5.
     default_tenant_id: str
@@ -93,6 +117,8 @@ class Settings:
     def __post_init__(self) -> None:
         if self.is_production:
             problems = []
+            if not self.database.url:
+                problems.append("DATABASE_URL is required in production")
             if self.crm.client_secret == DEV_CRM_CLIENT_SECRET:
                 problems.append("CRM_CLIENT_SECRET uses the development default")
             if self.internal.api_key == DEV_INTERNAL_API_KEY:
@@ -128,6 +154,14 @@ def load_settings() -> Settings:
             max_retries=_env_int("INTERNAL_API_MAX_RETRIES", 2),
             backoff_base_seconds=_env_float("INTERNAL_API_BACKOFF_BASE_SECONDS", 0.5),
             backoff_max_seconds=_env_float("INTERNAL_API_BACKOFF_MAX_SECONDS", 4.0),
+        ),
+        database=DatabaseSettings(
+            url=os.getenv("DATABASE_URL") or None,
+            pool_size=_env_int("DB_POOL_SIZE", 10),
+            max_overflow=_env_int("DB_MAX_OVERFLOW", 10),
+            pool_timeout_seconds=_env_float("DB_POOL_TIMEOUT_SECONDS", 5.0),
+            connect_timeout_seconds=_env_int("DB_CONNECT_TIMEOUT_SECONDS", 3),
+            lock_timeout_seconds=_env_float("SYNC_LOCK_TIMEOUT_SECONDS", 10.0),
         ),
         mapping_config_dir=Path(
             os.getenv("MAPPING_CONFIG_DIR", Path(__file__).resolve().parent.parent / "mapping" / "configs")

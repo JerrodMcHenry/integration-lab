@@ -110,3 +110,56 @@ if dev-default secrets or non-HTTPS upstream URLs are configured.
 **Why:** Fault injection and data seeding endpoints are dangerous if exposed.
 Failing at startup makes the misconfiguration obvious instead of silently
 ignoring it.
+
+## ED-013 — PostgreSQL advisory locks, transaction-scoped, for per-account serialisation
+**Decision:** `pg_advisory_xact_lock` on a dedicated connection, held for the
+whole sync, keyed by a 64-bit hash of `(tenant_id, crm_account_id)`.
+**Alternatives:** `SELECT … FOR UPDATE` on a lock row (needs a row per account
+and an upsert to create it); session-scoped `pg_advisory_lock` (an explicit
+unlock can fail and leave a pooled connection holding the lock); Redis locks
+(another dependency, plus lease-expiry semantics); optimistic concurrency at
+the destination (the mock CMS has no version field).
+**Why:** No extra tables or services. Released automatically on commit,
+rollback or session death.
+**Tradeoffs:** Holds one connection and an open transaction per in-flight sync,
+including during HTTP calls (bounded by client timeouts and
+`idle_in_transaction_session_timeout`). Hash collisions are possible but only
+cause unnecessary serialisation. Advisory locks don't work through a
+transaction-pooling PgBouncer; session pooling or direct connections are required.
+
+## ED-014 — Fail closed when the lock can't be acquired
+**Decision:** If the database is unreachable or the lock times out, the sync
+does not run. It is recorded as `failed` at stage `acquire_lock` with a
+retryable error.
+**Why:** Running unlocked could interleave writes from several workers. A
+retryable failure is visible and safe; a silent race is neither.
+
+## ED-015 — History is written inside the lock; persistence failures are surfaced
+**Decision:** The history insert happens before the lock is released. If it
+fails, `HistoryPersistenceError` carries the record, the record is logged at
+ERROR (identifiers only), and the API returns 503 with
+`X-Sync-History-Persisted: false` and the real outcome in the body.
+**Why:** History order then matches execution order per account. A failed
+history write must not hide the fact that the destination was changed.
+
+## ED-016 — VARCHAR + CHECK instead of PostgreSQL ENUM types; `seq` identity for ordering
+**Decision:** Status and stage are `varchar` with CHECK constraints. Ordering
+uses a `GENERATED ALWAYS AS IDENTITY` column instead of timestamps.
+**Why:** Adding a status later is a constraint swap in a migration, with no
+`ALTER TYPE` limitations. Identity ordering is unambiguous even when several
+records share a timestamp, and it matches the in-memory repository's
+insertion order.
+
+## ED-017 — Migrations are hand-written, forward-only by default
+**Decision:** `0001` is written by hand (reviewable SQL). Its downgrade raises
+unless `ALLOW_DESTRUCTIVE_DOWNGRADE=1`. `env.py` takes an advisory lock so
+concurrent `alembic upgrade` runs (several containers) serialise. A test
+compares the ORM metadata with the migrated schema to catch drift.
+**Why:** Prevents accidental data loss and keeps models and migrations in sync.
+
+## ED-018 — Integration tests use a dedicated `_test` database
+**Decision:** Integration tests use only `TEST_DATABASE_URL`, abort unless the
+database name ends in `_test`, create it if missing, migrate forward, and
+`TRUNCATE sync_records` between tests. They skip when PostgreSQL is
+unreachable, unless `REQUIRE_POSTGRES=1`.
+**Why:** Real-database coverage without any chance of touching development data.

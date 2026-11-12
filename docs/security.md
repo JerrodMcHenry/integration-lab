@@ -19,6 +19,13 @@ known gaps. It is not a claim of production readiness.
 | Path parameters URL-encoded in outbound calls | both clients | `test_account_id_is_url_encoded` |
 | Sync history reads require a tenant id | `sync_history.py` | `test_history_is_tenant_scoped` |
 | Tenant is never taken from caller input | `api/deps.py` | `test_tenant_cannot_be_chosen_by_caller` |
+| PostgreSQL published on 127.0.0.1 only. No credentials in the repo (compose requires `POSTGRES_PASSWORD` from gitignored `.env`) | `docker-compose.yml` | manual: LAN IP port 5434 closed |
+| No account payload columns in the database | `app/db/models.py` | `test_no_account_payload_columns`, live check: 0 rows contain account names |
+| SQL parameters never logged (`hide_parameters=True`) | `app/db/engine.py` | — |
+| DB constraints enforce tenant id format and failure/success consistency | migration `0001` | `test_check_constraints_reject_invalid_rows` |
+| Destructive downgrade requires explicit opt-in | migration `0001` | `test_destructive_downgrade_refused_without_explicit_opt_in` |
+| Integration tests can't touch non-test databases | `tests/integration/conftest.py` | name must end in `_test` (verified to abort) |
+| App container runs as a non-root user | `Dockerfile` | — |
 
 ## Known gaps (do not deploy)
 
@@ -28,6 +35,9 @@ known gaps. It is not a claim of production readiness.
 - **Secrets come from env vars.** There's no secret manager integration yet.
 - **Internal CMS auth is a static API key.** It's realistic for many internal
   systems, but there's no rotation story.
-- **Sync history is in memory.** No durable audit trail until M4.
+- **Database connection is unencrypted** (local Docker network). Production
+  would need `sslmode=verify-full` and a least-privilege DB role. The app
+  currently uses the database owner role for both migrations and runtime.
+- **Sync history is not tamper-evident** and has no retention policy yet.
 - **Mocks are not hardened.** No rate limiting, and in-memory idempotency
   and token stores grow until restart (tokens are purged on issue).

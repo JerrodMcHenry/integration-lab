@@ -1,3 +1,4 @@
+alembic==1.20.1
 annotated-doc==0.0.6
 annotated-types==0.8.0
 anyio==4.16.0
@@ -10,15 +11,20 @@ httptools==0.9.0
 httpx==0.28.1
 idna==3.20
 iniconfig==2.3.1
+Mako==1.4.3
+MarkupSafe==3.0.4
 opentelemetry-api==1.45.2
 packaging==26.3
 pluggy==1.7.0
+psycopg-binary==3.3.8
+psycopg==3.3.8
 pydantic==2.14.3
 pydantic_core==2.50.4
 Pygments==2.21.0
 pytest==9.2.0
 python-dotenv==1.2.4
 PyYAML==6.0.3
+SQLAlchemy==2.1.8
 starlette==1.10.0
 typing-inspection==0.4.5
 typing_extensions==4.16.0

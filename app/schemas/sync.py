@@ -22,6 +22,7 @@ class SyncStatus(str, Enum):
 
 
 class SyncStage(str, Enum):
+    ACQUIRE_LOCK = "acquire_lock"
     FETCH_SOURCE = "fetch_source"
     TRANSFORM = "transform"
     LOAD_DESTINATION = "load_destination"
