@@ -56,7 +56,7 @@ System (CMS). Both external systems are simulated by separate mock services.
 | Lock-ownership verification + processing deadline before destination writes | `app/services/account_sync.py` (`_WriteGate`) | ✅ (limitations below) |
 | Operational metrics (tenant JSON + platform Prometheus) | `app/api/ops.py` | ✅ |
 | Retention policy (dry-run by default) | `app/retention.py`, `python -m app.cli retention` | ✅ |
-| React monitoring dashboard | — | 🚧 M8 |
+| Integration health dashboard (React + TypeScript, PKCE sign-in, permission-aware replay) | `dashboard/` | ✅ |
 
 ## Separation of responsibilities
 
@@ -126,10 +126,12 @@ those fields. An optional CRM field that is empty clears the destination value.
   config *and* in `call_with_retry`), exponential backoff with full jitter and
   a cap. Only `retryable` errors are retried. CRM: GET only. CMS: GET/PATCH,
   plus POST because creates carry an `Idempotency-Key`.
-- **Job-level (🚧 M6–7):** a durable queue re-runs failed syncs where
-  `error.retryable` is true, with bounded attempts and a dead-letter queue.
-  Right now a failed sync is recorded and reported but **not** retried
-  automatically. The caller (or, later, the worker) has to try again.
+- **Job-level (implemented):** webhook-triggered syncs whose error is
+  `retryable` are re-queued by the worker with bounded exponential backoff and
+  jitter (`app/worker/retry_policy.py`, `RETRY_*`, `WORKER_MAX_ATTEMPTS`), then
+  dead-lettered. Operators replay failed or dead-lettered events (API or
+  dashboard). An on-demand `POST /sync/accounts/{id}` is not retried
+  automatically; the caller retries.
 
 ## Persistence (Milestone 4)
 

@@ -154,5 +154,16 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  dashboard:
+    # Demo UI (static build behind nginx). Forwards /api to the API and /idp to the mock IdP.
+    build: ./dashboard
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      api:
+        condition: service_started
+      mock-idp:
+        condition: service_started
+
 volumes:
   pgdata:

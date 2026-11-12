@@ -37,6 +37,10 @@ Management System.
   issuer, audience, expiry, `typ`), the tenant comes only from the token, and
   viewer/operator/admin permissions are enforced. Each tenant has its own CRM/CMS
   connections, secrets and versioned mappings.
+- **Integration health dashboard** (React + TypeScript, http://localhost:8080):
+  health metrics, the latest 100 CRM events, plain-language failure explanations,
+  retry history and permission-aware manual replay. Sign-in uses the
+  authorization code flow with PKCE. See [docs/demo-script.md](docs/demo-script.md).
 - **Mock services** for two tenants' CRMs and CMSs plus a dev-only OIDC
   provider. Admin routes are disabled, and the mock IdP refuses to start, in production/staging.
 
@@ -46,7 +50,9 @@ Management System.
 cp .env.example .env
 # set POSTGRES_PASSWORD in .env, e.g. the output of: openssl rand -hex 24
 
-docker compose up -d --build --wait   # db → migrate + seed → mocks + IdP → api (4 procs) + worker x2
+docker compose up -d --build --wait   # db → migrate + seed → mocks + IdP → api (4 procs) + worker x2 + dashboard
+
+# Dashboard: open http://localhost:8080 and sign in (e.g. meridian-operator / dev-only-password)
 
 # Get a token from the mock IdP (users: meridian-{admin,operator,viewer}, harbor-{admin,operator})
 TOKEN=$(curl -s localhost:8090/oauth/token -d grant_type=password -d client_id=integrationlab-cli \
@@ -69,7 +75,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" localhost:8000/webhooks/events/<i
 docker compose stop                   # stop; data is kept in the integrationlab_pgdata volume
 ```
 
-All ports are bound to `127.0.0.1` only: API 8000, IdP 8090, Meridian CRM/CMS
+All ports are bound to `127.0.0.1` only: dashboard 8080, API 8000, IdP 8090, Meridian CRM/CMS
 8001/8002, Harbor CRM/CMS 8011/8012, PostgreSQL 5434. OpenAPI docs: http://localhost:8000/docs
 
 ## Local development (app on the host, DB in Docker)
@@ -91,6 +97,16 @@ python -m app.worker                         # background event worker
 ```
 
 PostgreSQL is required: the API, worker and CLI refuse to start without `DATABASE_URL`.
+
+## Dashboard development
+
+```bash
+docker compose up -d --wait api mock-idp   # the backend the dashboard talks to
+cd dashboard && npm ci
+npm run dev        # http://localhost:5173 (forwards /api to :8000 and /idp to :8090)
+npm test           # unit tests (Vitest)
+npm run build      # typecheck + production build
+```
 
 ## Tests
 
@@ -134,5 +150,4 @@ Engineering rules for contributors and AI agents: [CLAUDE.md](CLAUDE.md).
 - [Security](docs/security.md): authentication flow, permission model, isolation, remaining risks
 - [Troubleshooting](docs/troubleshooting.md)
 - [Engineering decisions](docs/engineering-decisions.md)
-
-The demo script will be added with the dashboard.
+- [Demo script](docs/demo-script.md): a 10-minute walkthrough of the dashboard

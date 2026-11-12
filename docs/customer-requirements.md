@@ -23,7 +23,7 @@ which causes drift and delays onboarding.
 | R9 | Client data must not appear in operational logs | ✅ tested |
 | R10 | Access restricted to authorized Meridian users, isolated from other tenants | ✅ OIDC + RBAC (viewer/operator/admin); tenant from token; per-tenant credentials and mappings |
 | R10a | Meridian admins can adjust their own field mapping without engineering involvement | ✅ `PUT /admin/mapping` (validated, versioned, audited by user) |
-| R11 | Operational dashboard for integration health | 🚧 M8 |
+| R11 | Operational dashboard for integration health | ✅ `dashboard/`: health metrics, latest 100 events, failure explanations, retry history, manual replay for operators |
 
 ## Field mapping (Meridian, v1)
 

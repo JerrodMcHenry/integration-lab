@@ -40,6 +40,10 @@ Intentional. The integration fixtures truncate tables. Point
 | 403 `tenant is not provisioned` / `suspended` | no active `tenants` row for the token's `tenant_id`. Run `python -m app.cli seed-dev` (dev) |
 | 503 `identity provider unavailable` | API can't fetch JWKS. Check `OIDC_JWKS_URL` / that mock-idp is running |
 | 500 `tenant_connection_invalid` | tenant has no `tenant_integrations` row, or a referenced `IL_<TENANT>__…` env var is missing |
+| Dashboard sign-in shows "redirect_uri is not registered" | the dashboard isn't running on port 5173 (Vite) or 8080 (compose). Use one of those, or add the exact `…/callback` URL to `MOCK_IDP_DASHBOARD_REDIRECT_URIS` |
+| Dashboard says "The sign-in response didn't match this request" | the callback's `state` didn't match this tab's sign-in (a stale or copied callback URL). Sign in again from the dashboard |
+| Dashboard returns to sign-in with "Your session has expired" | the token expired (15 min) or the mock IdP restarted. Sign in again |
+| Dashboard tiles say "Unavailable" | `GET /ops/metrics` failed (API or database down). Values are never shown as 0 in this case |
 
 ## Sync results
 

@@ -32,7 +32,9 @@ TOKEN=$(curl -s localhost:8090/oauth/token -d grant_type=password -d client_id=i
 curl -H "Authorization: Bearer $TOKEN" localhost:8000/me
 ```
 
-Services (all on 127.0.0.1): API 8000, mock IdP 8090, Meridian CRM/CMS 8001/8002,
+Dashboard: http://localhost:8080 (sign in as `meridian-operator`, password `dev-only-password`).
+
+Services (all on 127.0.0.1): dashboard 8080, API 8000, mock IdP 8090, Meridian CRM/CMS 8001/8002,
 Harbor CRM/CMS 8011/8012, PostgreSQL 5434, plus two `worker` replicas. The
 README has a full walkthrough (CRM change → webhook → worker → CMS).
 
@@ -54,7 +56,8 @@ README has a full walkthrough (CRM change → webhook → worker → CMS).
 | `app/schemas/` | `internal_customer.py` (destination contract + **field ownership**), `sync.py` (`SyncRecord`) |
 | `app/core/config.py` | All settings from env vars, plus production safety checks |
 | `app/cli.py`, `retention.py`, `seed.py` | `seed-dev` and `retention` commands |
-| `mock_crm/`, `mock_internal/`, `mock_idp/` | Simulated external systems (dev/test only) |
+| `mock_crm/`, `mock_internal/`, `mock_idp/` | Simulated external systems (dev/test only). `mock_idp` also serves the dashboard's login page (authorization code + PKCE) |
+| `dashboard/` | React + TypeScript UI, one screen. `src/App.tsx` (sign-in gate, 5 s polling, selection), `auth.ts` (PKCE sign-in), `api.ts` (one function per endpoint, `ApiError`), `types.ts` (mirrors API models), `format.ts` (**customer-facing wording** for statuses and error codes), `components/` (`Header`, `HealthSummary`, `EventList`, `EventDetail`, `StatusBadge`). Uses only existing API endpoints; served by nginx (`nginx.conf`) which forwards `/api` and `/idp` |
 | `migrations/` | Alembic, forward-only (`0001`–`0005`) |
 
 ## 4. Where to find things
@@ -71,6 +74,8 @@ README has a full walkthrough (CRM change → webhook → worker → CMS).
 | change retry timing | `app/worker/retry_policy.py`, env `RETRY_*`, `WORKER_MAX_ATTEMPTS` |
 | see how secrets are looked up | `app/services/secrets.py` `EnvSecretResolver.resolve` |
 | see a table definition | `app/db/models.py` (the migration of the same name has the DDL) |
+| change dashboard wording for a status or error code | `dashboard/src/format.ts` (a new backend error code also needs an entry there) |
+| see which endpoint a dashboard panel calls | `dashboard/src/api.ts` |
 
 ## 5. How data moves
 
@@ -139,7 +144,8 @@ README has a full walkthrough (CRM change → webhook → worker → CMS).
 ```bash
 docker compose up -d --wait db
 pytest -m "not postgres"        # ~360 fast unit tests, no database
-REQUIRE_POSTGRES=1 pytest       # everything (~525); fails instead of skipping if Postgres is down
+REQUIRE_POSTGRES=1 pytest       # everything (~565); fails instead of skipping if Postgres is down
+cd dashboard && npm test        # frontend unit tests (Vitest + Testing Library)
 ```
 
 | Location | Contents |
@@ -149,6 +155,7 @@ REQUIRE_POSTGRES=1 pytest       # everything (~525); fails instead of skipping i
 | `tests/conftest.py`, `tests/integration/conftest.py` | **fixtures only** |
 | `tests/support/` | shared helpers: `data` (constants), `clients`, `identity` (test IdP), `tenants` (`World`: two in-process tenants), `db`, `servers`, `webhooks`, `mappings`, `concurrency` (bounded waits: use these instead of bare `join()`/`wait()`/`pool.apply`) |
 | `tests/integration/_workers.py` | functions run in separate OS processes (concurrency tests) |
+| `dashboard/src/**/*.test.ts(x)` | frontend: PKCE and state checks, API error handling, permission-gated replay, metric display |
 
 ## 10. Key decisions (see engineering-decisions.md)
 

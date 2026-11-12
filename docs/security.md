@@ -48,8 +48,8 @@ followed by known gaps. It is not a claim of production readiness.
 RS256 `at+jwt` access tokens, the `password` grant for named demo users and
 `client_credentials` for a tenant-bound service account, plus dev-only key
 rotation. It **refuses to start** when `APP_ENV` is production, prod or staging.
-It does not implement authorization code + PKCE, ID tokens, refresh tokens or
-userinfo. The API's verifier is IdP-agnostic: point `OIDC_ISSUER`,
+For the dashboard it implements the **authorization code flow with PKCE**
+(below). It does not implement ID tokens, refresh tokens or userinfo. The API's verifier is IdP-agnostic: point `OIDC_ISSUER`,
 `OIDC_AUDIENCE` (and optionally `OIDC_JWKS_URL`, `OIDC_TENANT_CLAIM`,
 `OIDC_ROLES_CLAIM`) at Keycloak, Entra ID, Auth0 or Okta configured to emit
 `tenant_id` and `roles` claims.
@@ -57,6 +57,37 @@ userinfo. The API's verifier is IdP-agnostic: point `OIDC_ISSUER`,
 Demo users (password `dev-only-password`): `meridian-admin`,
 `meridian-operator`, `meridian-viewer`, `meridian-norole`, `harbor-admin`,
 `harbor-operator`.
+
+### Dashboard sign-in (authorization code + PKCE)
+
+The dashboard (`dashboard/`) is a **public client** (`integrationlab-dashboard`):
+it has no client secret, and none appears in the browser bundle.
+
+- **PKCE, S256 only.** The browser generates a random verifier, sends only its
+  SHA-256 challenge to `/authorize`, and proves possession of the verifier at
+  `/oauth/token`. `plain` is rejected.
+- **Authorization codes** are random, valid for 60 s, and deleted on the first
+  redemption attempt, including a failed one. A code is bound to the client,
+  redirect URI and challenge it was issued for.
+- **Redirect URIs** must match the allow-list exactly
+  (`MOCK_IDP_DASHBOARD_REDIRECT_URIS`; default `http://localhost:5173/callback`
+  and `http://localhost:8080/callback`). An invalid request shows an error page
+  and is never redirected.
+- **State:** the browser sends a random `state`, stores it with the verifier for
+  this tab only, and rejects a callback whose `state` doesn't match. The pending
+  entry is deleted before checking, so a callback can't be used twice.
+- **The login page** escapes every reflected value and sends `no-store`,
+  `X-Frame-Options: DENY` and a restrictive CSP.
+- **The token** lives in `sessionStorage`: one tab, cleared when it closes. This
+  is acceptable for the local demo only. Any 401 returns the user to sign-in.
+  There are no refresh tokens; sessions last as long as the access token (15 min).
+- **Same origin:** nginx (or Vite in development) serves the dashboard and
+  forwards `/api` and `/idp`, so the API has no CORS configuration. The
+  dashboard's pages send a CSP allowing scripts, styles and connections only
+  from the same origin, plus `nosniff` and `Referrer-Policy: no-referrer`.
+- **The API stays authoritative.** The dashboard hides or disables actions based
+  on `GET /me` permissions as a convenience only. Every request is still
+  authorized, tenant-scoped and (for replay) audited by the API.
 
 ## Webhook authentication (Milestone 6)
 
@@ -159,9 +190,12 @@ the old logic (verified).
 
 ## Remaining risks (do not deploy)
 
-1. **Mock IdP only.** No authorization code + PKCE flow for browser login yet
-   (the M8 dashboard needs it). The `password` grant is a dev convenience and
-   is deprecated in OAuth 2.1.
+1. **Mock IdP only.** It has no user store, sessions, consent, MFA or refresh
+   tokens, and keeps authorization codes in memory (a single process). The
+   `password` grant is a dev convenience and is deprecated in OAuth 2.1. The
+   dashboard keeps its token in `sessionStorage`, which is exposed to any script
+   running on the page; acceptable for the local demo, but a production
+   deployment should use a backend-for-frontend or in-memory tokens with a real IdP.
 2. **No token revocation.** A stolen access token is valid until `exp`
    (15 min from the mock IdP, ≤ 1 h by policy). Mitigations: short lifetimes;
    suspending the tenant blocks all of its tokens immediately.

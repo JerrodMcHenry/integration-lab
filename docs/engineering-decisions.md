@@ -337,3 +337,24 @@ failed/dead-lettered events are exactly the ones operators still need.
   Destructive fixtures use only a validated `TEST_DATABASE_URL`.
 **Why:** one runtime mode to reason about, configuration that reflects what's
 actually used, and no path by which a test can touch development data.
+
+## ED-038 — Dashboard: one screen, existing API, PKCE sign-in
+**Decisions:**
+- **One screen, six components, no router or state library.** The demo is one
+  workflow (health → event → explanation → replay); `useState` plus a 5 s poll
+  is enough. Dependencies: React, React DOM; dev-only Vite, TypeScript, Vitest,
+  Testing Library, jsdom.
+- **No new API endpoints.** The dashboard uses `/me`, `/tenant`, `/ops/metrics`,
+  `/webhooks/events` (latest 100, filtered on the client because "needs
+  attention" spans two statuses), `/webhooks/events/{id}`, `/…/attempts`,
+  `/sync/history/{id}` and `/…/replay`.
+- **Browser sign-in via authorization code + PKCE** added to the mock IdP: the
+  standard flow for a browser public client. The API needed no change.
+- **Same-origin proxy (nginx or Vite)** instead of CORS on the API.
+- **Customer-facing wording lives in one file** (`dashboard/src/format.ts`),
+  keyed by the backend's status and error codes. Raw codes stay available under
+  "Technical details".
+- **Replay restarts the attempt counter** (existing backend behaviour). The
+  timeline marks the point where the number drops as "Manually replayed".
+**Why:** the smallest UI that tells the recovery story while leaving every
+security decision with the API.
