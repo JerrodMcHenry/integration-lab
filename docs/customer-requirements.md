@@ -9,7 +9,8 @@ which causes drift and delays onboarding.
 
 | # | Requirement | Status |
 |---|---|---|
-| R1 | Account changes in Salesforce reach the CMS without manual re-entry | ✅ on-demand sync via `POST /sync/accounts/{id}`. Event-driven via webhooks 🚧 M6 |
+| R1 | Account changes in Salesforce reach the CMS without manual re-entry | ✅ event-driven: signed CRM webhooks → durable inbox → workers. On-demand `POST /sync/accounts/{id}` also available |
+| R1a | No account change is lost if IntegrationLab restarts or a worker crashes | ✅ persisted before acknowledgement. Leases recover crashed work (bounded attempts) |
 | R2 | Salesforce is the system of record for account information (name, industry, revenue, relationship manager) | ✅ |
 | R3 | The CMS is the system of record for **onboarding status** and **risk classification**; sync must never overwrite them | ✅ enforced in 3 layers, tested end to end |
 | R4 | Meridian's industry taxonomy differs from Salesforce's | ✅ `value_map` in `meridian.json` |
@@ -19,7 +20,8 @@ which causes drift and delays onboarding.
 | R7a | Sync history must survive restarts and must not contain client data | ✅ PostgreSQL, identifiers and field names only |
 | R8 | No duplicate customers from repeated or concurrent syncs | ✅ idempotent create + diff + PostgreSQL advisory lock across processes |
 | R9 | Client data must not appear in operational logs | ✅ tested |
-| R10 | Access restricted to authorized Meridian users, isolated from other tenants | 🚧 M5 |
+| R10 | Access restricted to authorized Meridian users, isolated from other tenants | ✅ OIDC + RBAC (viewer/operator/admin); tenant from token; per-tenant credentials and mappings |
+| R10a | Meridian admins can adjust their own field mapping without engineering involvement | ✅ `PUT /admin/mapping` (validated, versioned, audited by user) |
 | R11 | Operational dashboard for integration health | 🚧 M8 |
 
 ## Field mapping (Meridian, v1)

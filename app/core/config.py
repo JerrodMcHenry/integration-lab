@@ -100,14 +100,86 @@ class DatabaseSettings:
             raise ValueError("DB_CONNECT_TIMEOUT_SECONDS must be >= 1")
 
 
+DEV_OIDC_ISSUER = "http://localhost:8090"
+
+
+@dataclass(frozen=True)
+class OIDCSettings:
+    #: Exact ``iss`` value expected in access tokens.
+    issuer: str
+    #: Required ``aud`` value (this API's identifier at the IdP).
+    audience: str
+    #: JWKS location. ``None`` means discover it from ``{issuer}/.well-known/openid-configuration``.
+    jwks_url: str | None = None
+    algorithms: tuple[str, ...] = ("RS256",)
+    leeway_seconds: int = 30
+    #: RFC 9068 JWT access tokens carry ``typ: at+jwt``. Rejecting other types stops
+    #: ID tokens (or other JWTs from the same IdP) being replayed as access tokens.
+    required_token_type: str | None = "at+jwt"
+    tenant_claim: str = "tenant_id"
+    roles_claim: str = "roles"
+    jwks_cache_seconds: int = 600
+    #: Reject tokens whose lifetime (exp - iat) exceeds this, even if correctly signed.
+    max_token_lifetime_seconds: int = 3600
+
+    def __post_init__(self) -> None:
+        if not self.issuer or not self.audience:
+            raise ValueError("OIDC_ISSUER and OIDC_AUDIENCE are required")
+        allowed = {"RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "EdDSA"}
+        if not self.algorithms or not set(self.algorithms) <= allowed:
+            # Symmetric (HS*) and "none" are never accepted: they enable key-confusion attacks.
+            raise ValueError(f"OIDC_ALGORITHMS must be a subset of {sorted(allowed)}")
+        if not 0 <= self.leeway_seconds <= 120:
+            raise ValueError("OIDC_LEEWAY_SECONDS must be between 0 and 120")
+        if not 60 <= self.max_token_lifetime_seconds <= 86400:
+            raise ValueError("OIDC_MAX_TOKEN_LIFETIME_SECONDS must be between 60 and 86400")
+
+
+@dataclass(frozen=True)
+class WebhookSettings:
+    #: Max |now - signed timestamp|. Older (or future-dated) deliveries are rejected as replays.
+    tolerance_seconds: int = 300
+    max_body_bytes: int = 64 * 1024
+
+    def __post_init__(self) -> None:
+        if not 30 <= self.tolerance_seconds <= 3600:
+            raise ValueError("WEBHOOK_TOLERANCE_SECONDS must be between 30 and 3600")
+        if not 1024 <= self.max_body_bytes <= 1024 * 1024:
+            raise ValueError("WEBHOOK_MAX_BODY_BYTES must be between 1 KiB and 1 MiB")
+
+
+@dataclass(frozen=True)
+class WorkerSettings:
+    poll_interval_seconds: float = 1.0
+    batch_size: int = 10
+    #: How long a claimed event is reserved. None = derived from the worst-case sync duration.
+    lease_seconds: float | None = None
+    #: Max claims per event. Bounds crash loops: an event whose processing keeps
+    #: killing workers is marked failed instead of being reclaimed forever.
+    max_attempts: int = 5
+
+    def __post_init__(self) -> None:
+        if not 0.05 <= self.poll_interval_seconds <= 60:
+            raise ValueError("WORKER_POLL_INTERVAL_SECONDS must be between 0.05 and 60")
+        if not 1 <= self.batch_size <= 100:
+            raise ValueError("WORKER_BATCH_SIZE must be between 1 and 100")
+        if self.lease_seconds is not None and not 1 <= self.lease_seconds <= 3600:
+            raise ValueError("WORKER_LEASE_SECONDS must be between 1 and 3600")
+        if not 1 <= self.max_attempts <= 20:
+            raise ValueError("WORKER_MAX_ATTEMPTS must be between 1 and 20")
+
+
 @dataclass(frozen=True)
 class Settings:
     environment: str
     crm: CRMSettings
     internal: InternalSystemSettings
     database: DatabaseSettings
+    oidc: OIDCSettings
+    webhooks: WebhookSettings
+    worker: WorkerSettings
     mapping_config_dir: Path
-    #: Single-tenant placeholder until authentication lands in Milestone 5.
+    #: Tenant used only by the database-less development fallback.
     default_tenant_id: str
 
     @property
@@ -119,6 +191,12 @@ class Settings:
             problems = []
             if not self.database.url:
                 problems.append("DATABASE_URL is required in production")
+            if not self.oidc.issuer.startswith("https://"):
+                problems.append("OIDC_ISSUER must use https in production")
+            if self.oidc.issuer.rstrip("/") == DEV_OIDC_ISSUER:
+                problems.append("OIDC_ISSUER points at the development mock IdP")
+            if self.oidc.jwks_url and not self.oidc.jwks_url.startswith("https://"):
+                problems.append("OIDC_JWKS_URL must use https in production")
             if self.crm.client_secret == DEV_CRM_CLIENT_SECRET:
                 problems.append("CRM_CLIENT_SECRET uses the development default")
             if self.internal.api_key == DEV_INTERNAL_API_KEY:
@@ -162,6 +240,28 @@ def load_settings() -> Settings:
             pool_timeout_seconds=_env_float("DB_POOL_TIMEOUT_SECONDS", 5.0),
             connect_timeout_seconds=_env_int("DB_CONNECT_TIMEOUT_SECONDS", 3),
             lock_timeout_seconds=_env_float("SYNC_LOCK_TIMEOUT_SECONDS", 10.0),
+        ),
+        oidc=OIDCSettings(
+            issuer=os.getenv("OIDC_ISSUER", DEV_OIDC_ISSUER).rstrip("/"),
+            audience=os.getenv("OIDC_AUDIENCE", "integrationlab-api"),
+            jwks_url=os.getenv("OIDC_JWKS_URL") or None,
+            algorithms=tuple(a.strip() for a in os.getenv("OIDC_ALGORITHMS", "RS256").split(",") if a.strip()),
+            leeway_seconds=_env_int("OIDC_LEEWAY_SECONDS", 30),
+            required_token_type=os.getenv("OIDC_REQUIRED_TOKEN_TYPE", "at+jwt") or None,
+            tenant_claim=os.getenv("OIDC_TENANT_CLAIM", "tenant_id"),
+            roles_claim=os.getenv("OIDC_ROLES_CLAIM", "roles"),
+            jwks_cache_seconds=_env_int("OIDC_JWKS_CACHE_SECONDS", 600),
+            max_token_lifetime_seconds=_env_int("OIDC_MAX_TOKEN_LIFETIME_SECONDS", 3600),
+        ),
+        webhooks=WebhookSettings(
+            tolerance_seconds=_env_int("WEBHOOK_TOLERANCE_SECONDS", 300),
+            max_body_bytes=_env_int("WEBHOOK_MAX_BODY_BYTES", 64 * 1024),
+        ),
+        worker=WorkerSettings(
+            poll_interval_seconds=_env_float("WORKER_POLL_INTERVAL_SECONDS", 1.0),
+            batch_size=_env_int("WORKER_BATCH_SIZE", 10),
+            lease_seconds=_env_float("WORKER_LEASE_SECONDS", 0) or None,
+            max_attempts=_env_int("WORKER_MAX_ATTEMPTS", 5),
         ),
         mapping_config_dir=Path(
             os.getenv("MAPPING_CONFIG_DIR", Path(__file__).resolve().parent.parent / "mapping" / "configs")

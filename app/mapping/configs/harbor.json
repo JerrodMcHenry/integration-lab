@@ -1,0 +1,13 @@
+{
+  "tenant_id": "harbor",
+  "version": 1,
+  "description": "Harborview Trust: Salesforce Account -> Harborview client register",
+  "fields": [
+    {"source": "Id", "target": "external_crm_id", "required": true, "transforms": ["strip"]},
+    {"source": "Name", "target": "legal_name", "required": true, "transforms": ["collapse_whitespace", "upper"]},
+    {"source": "OwnerName", "target": "relationship_manager", "required": true, "transforms": ["collapse_whitespace"]},
+    {"source": "Industry", "target": "industry_segment", "transforms": ["strip", "upper", {"name": "default", "args": {"value": "UNCLASSIFIED"}}]},
+    {"source": "AnnualRevenue", "target": "annual_revenue_usd", "transforms": [{"name": "to_decimal", "args": {"places": 0}}]},
+    {"source": "LastModifiedDate", "target": "crm_last_modified_at", "transforms": ["iso_datetime"]}
+  ]
+}

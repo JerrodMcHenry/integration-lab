@@ -5,17 +5,19 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_current_tenant, get_sync_history, get_sync_service
+from app.api.deps import get_sync_history, get_sync_service
 from app.main import app
 
 
 @pytest.fixture
-def api(sync_service, history):
+def api(sync_service, history, auth):
     app.dependency_overrides[get_sync_service] = lambda: sync_service
     app.dependency_overrides[get_sync_history] = lambda: history
-    with TestClient(app) as tc:
+    # Meridian operator: has sync:run and history:read.
+    with TestClient(app, headers=auth.headers("operator", "meridian")) as tc:
         yield tc
-    app.dependency_overrides.clear()
+    app.dependency_overrides.pop(get_sync_service, None)
+    app.dependency_overrides.pop(get_sync_history, None)
 
 
 def test_sync_create_then_unchanged(api):
@@ -68,10 +70,10 @@ def test_history_record_from_other_tenant_is_invisible(api, sync_service):
 
 
 def test_tenant_cannot_be_chosen_by_caller(api):
-    """Until M5 auth, the tenant comes only from server config, never from the request."""
-    api.post("/sync/accounts/SF-1001", headers={"X-Tenant-ID": "evil"}, params={"tenant_id": "evil"})
-    records = api.get("/sync/history", params={"tenant_id": "evil"}).json()
-    assert {r["tenant_id"] for r in records} == {get_current_tenant()}
+    """The tenant comes only from the verified token, never from headers or parameters."""
+    api.post("/sync/accounts/SF-1001", headers={"X-Tenant-ID": "harbor"}, params={"tenant_id": "harbor"})
+    records = api.get("/sync/history", params={"tenant_id": "harbor"}).json()
+    assert {r["tenant_id"] for r in records} == {"meridian"}
 
 
 def test_openapi_documents_sync_endpoints(api):

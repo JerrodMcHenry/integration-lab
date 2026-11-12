@@ -1,18 +1,34 @@
-from fastapi import FastAPI, Request
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from app.api.admin import router as admin_router
 from app.api.deps import get_engine
 from app.api.sync import router as sync_router
+from app.api.webhooks import router as webhooks_router
+from app.auth.dependencies import require
+from app.auth.permissions import Permission
+from app.auth.tokens import Principal
 from app.core.config import get_settings
 from app.repositories.sync_history import RepositoryError, RepositoryUnavailableError
 from app.schemas.account import AccountCreate
 
 # Fail fast on unsafe configuration (e.g. dev secrets in production).
-get_settings()
+_settings = get_settings()
 
-app = FastAPI(title="IntegrationLab", version="0.3.0")
+app = FastAPI(
+    title="IntegrationLab",
+    version="0.6.0",
+    # Interactive docs are a development convenience; not served in production.
+    docs_url=None if _settings.is_production else "/docs",
+    redoc_url=None if _settings.is_production else "/redoc",
+    openapi_url=None if _settings.is_production else "/openapi.json",
+)
 app.include_router(sync_router)
+app.include_router(admin_router)
+app.include_router(webhooks_router)
 
 
 @app.exception_handler(RepositoryError)
@@ -47,7 +63,9 @@ def health_check():
     
     
 @app.post("/accounts", status_code=201)
-def create_account(account: AccountCreate):
+def create_account(account: AccountCreate,
+                   _principal: Annotated[Principal, Depends(require(Permission.SYNC_RUN))]):
+    """Legacy M1 intake endpoint (validates and echoes). Now requires sync:run."""
     return {
         "message": "Account recieved successfully",
         "account": account

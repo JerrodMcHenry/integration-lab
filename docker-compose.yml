@@ -1,21 +1,25 @@
 # IntegrationLab local development stack.
 #
 # Every published port is bound to 127.0.0.1, so nothing is reachable from
-# other machines. PostgreSQL credentials come from .env (gitignored); compose
-# refuses to start if POSTGRES_PASSWORD is unset. No host bind mounts are used
-# (Docker Desktop on macOS can block on folder-access prompts for ~/Documents).
-# The integration test database is created by the test fixtures.
+# other machines. Credentials come from .env (gitignored); compose refuses to
+# start if POSTGRES_PASSWORD is unset. No host bind mounts are used (Docker
+# Desktop on macOS can block on folder-access prompts for ~/Documents). The
+# integration test database is created by the test fixtures.
+#
+# Tenants: each tenant has its own CRM org and internal CMS, as in reality.
+#   meridian -> mock-crm (8001) + mock-cms (8002)
+#   harbor   -> mock-crm-harbor (8011) + mock-cms-harbor (8012)
+# Identity:  mock-idp (8090), development only (refuses to start in production).
+# Events:    mock CRMs -> signed webhooks -> api (persist, 202) -> worker x2 -> sync.
 name: integrationlab
 
 x-app: &app
   build: .
   image: integrationlab-app:local
   env_file: .env
-  environment: &app-env
-    APP_ENV: development
-    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-integrationlab}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-integrationlab}
-    CRM_BASE_URL: http://mock-crm:8001
-    INTERNAL_API_BASE_URL: http://mock-cms:8002
+
+x-app-env: &app-env
+  APP_ENV: development
 
 services:
   db:
@@ -38,37 +42,117 @@ services:
 
   migrate:
     <<: *app
-    command: ["alembic", "upgrade", "head"]
+    # Forward-only migrations, then insert development tenants if absent (never overwrites).
+    command: ["sh", "-c", "alembic upgrade head && python -m app.cli seed-dev"]
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-integrationlab}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-integrationlab}
+      SEED_MERIDIAN_CRM_URL: http://mock-crm:8001
+      SEED_MERIDIAN_CMS_URL: http://mock-cms:8002
+      SEED_HARBOR_CRM_URL: http://mock-crm-harbor:8001
+      SEED_HARBOR_CMS_URL: http://mock-cms-harbor:8002
     depends_on:
       db:
         condition: service_healthy
     restart: "no"
 
+  mock-idp:
+    <<: *app
+    command: ["uvicorn", "mock_idp.main:app", "--host", "0.0.0.0", "--port", "8090"]
+    environment:
+      <<: *app-env
+      # Tokens are requested from the host, so the issuer is the host-visible URL.
+      MOCK_IDP_ISSUER: http://localhost:8090
+    ports:
+      - "127.0.0.1:8090:8090"
+
   mock-crm:
     <<: *app
     command: ["uvicorn", "mock_crm.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      <<: *app-env
+      MOCK_CRM_DATASET: meridian
+      MOCK_CRM_CLIENT_ID: integrationlab-dev
+      MOCK_CRM_CLIENT_SECRET: ${IL_MERIDIAN__CRM_CLIENT_SECRET:?Set IL_MERIDIAN__CRM_CLIENT_SECRET in .env}
+      # Account updates emit signed webhooks to IntegrationLab (like Salesforce outbound messages).
+      MOCK_CRM_WEBHOOK_URL: http://api:8000/webhooks/crm/meridian
+      MOCK_CRM_WEBHOOK_SECRET: ${IL_MERIDIAN__WEBHOOK_SECRET:?Set IL_MERIDIAN__WEBHOOK_SECRET in .env}
     ports:
       - "127.0.0.1:8001:8001"
 
   mock-cms:
     <<: *app
     command: ["uvicorn", "mock_internal.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    environment:
+      <<: *app-env
+      MOCK_INTERNAL_API_KEY: ${IL_MERIDIAN__CMS_API_KEY:?Set IL_MERIDIAN__CMS_API_KEY in .env}
     ports:
       - "127.0.0.1:8002:8002"
+
+  mock-crm-harbor:
+    <<: *app
+    command: ["uvicorn", "mock_crm.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      <<: *app-env
+      MOCK_CRM_DATASET: harbor
+      MOCK_CRM_CLIENT_ID: harbor-dev
+      MOCK_CRM_CLIENT_SECRET: ${IL_HARBOR__CRM_CLIENT_SECRET:?Set IL_HARBOR__CRM_CLIENT_SECRET in .env}
+      MOCK_CRM_WEBHOOK_URL: http://api:8000/webhooks/crm/harbor
+      MOCK_CRM_WEBHOOK_SECRET: ${IL_HARBOR__WEBHOOK_SECRET:?Set IL_HARBOR__WEBHOOK_SECRET in .env}
+    ports:
+      - "127.0.0.1:8011:8001"
+
+  mock-cms-harbor:
+    <<: *app
+    command: ["uvicorn", "mock_internal.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    environment:
+      <<: *app-env
+      MOCK_INTERNAL_API_KEY: ${IL_HARBOR__CMS_API_KEY:?Set IL_HARBOR__CMS_API_KEY in .env}
+    ports:
+      - "127.0.0.1:8012:8002"
 
   api:
     <<: *app
     # Several worker processes, so the cross-process advisory lock is exercised in normal use.
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-integrationlab}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-integrationlab}
+      OIDC_ISSUER: http://localhost:8090
+      # Keys are fetched over the internal network; the issuer string must still match.
+      OIDC_JWKS_URL: http://mock-idp:8090/jwks
+      OIDC_AUDIENCE: integrationlab-api
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
       migrate:
         condition: service_completed_successfully
+      mock-idp:
+        condition: service_started
       mock-crm:
         condition: service_started
       mock-cms:
         condition: service_started
+      mock-crm-harbor:
+        condition: service_started
+      mock-cms-harbor:
+        condition: service_started
+
+  worker:
+    <<: *app
+    # Durable event processing, independent of the API. Two replicas share the queue via
+    # FOR UPDATE SKIP LOCKED; per-account syncs are serialised by the advisory lock.
+    command: ["python", "-m", "app.worker"]
+    deploy:
+      replicas: 2
+    stop_grace_period: 30s   # SIGTERM -> finish the current event, then exit
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-integrationlab}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-integrationlab}
+      OIDC_ISSUER: http://localhost:8090
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

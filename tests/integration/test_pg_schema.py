@@ -42,6 +42,21 @@ def test_models_match_migrations(pg_engine):
     assert diff == []
 
 
+def test_check_constraint_names_match_models(pg_engine):
+    """Regression: 0001 applied the naming convention twice (ck_t_ck_t_x). 0003 renames them."""
+    from sqlalchemy import CheckConstraint
+
+    # SQLAlchemy stores the convention-applied name (ck_<table>_<name>) on the constraint.
+    expected = {(t.name, str(c.name)) for t in Base.metadata.sorted_tables
+                for c in t.constraints if isinstance(c, CheckConstraint)}
+    assert all(name.startswith(f"ck_{t}_") and f"_ck_{t}_" not in name for t, name in expected)
+    with pg_engine.connect() as conn:
+        actual = set(conn.execute(text(
+            "SELECT conrelid::regclass::text, conname FROM pg_constraint "
+            "WHERE contype = 'c' AND connamespace = 'public'::regnamespace")).all())
+    assert actual == expected
+
+
 def test_no_account_payload_columns(pg_engine):
     columns = {c["name"] for c in inspect(pg_engine).get_columns("sync_records")}
     assert columns == {

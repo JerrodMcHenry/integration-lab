@@ -8,7 +8,7 @@ IntegrationLab synchronizes customer account records for **Meridian Capital**
 from a Salesforce-style CRM into Meridian's internal Customer Management
 System (CMS). Both external systems are simulated by separate mock services.
 
-## Current state (Milestone 4 complete)
+## Current state (Milestone 6 complete)
 
 ```
                      ┌──────────────────────────── IntegrationLab (FastAPI :8000) ───────────────────────────┐
@@ -41,10 +41,17 @@ System (CMS). Both external systems are simulated by separate mock services.
 | Per-account concurrency lock | `app/services/locks.py` | ✅ PostgreSQL advisory locks (in-process fallback) |
 | Schema & migrations | `app/db/models.py`, `migrations/` | ✅ Alembic `0001` |
 | Docker Compose stack | `docker-compose.yml`, `Dockerfile` | ✅ |
-| Sync API | `app/api/sync.py` | ⚠️ unauthenticated, single tenant |
+| Sync API | `app/api/sync.py` | ✅ OIDC-authenticated, RBAC, tenant from token |
+| Authentication & RBAC | `app/auth/` | ✅ JWT (RFC 9068) verification, permissions |
+| Tenants, per-tenant integrations, versioned mappings | `app/repositories/tenants.py`, migration `0002` | ✅ |
+| Per-tenant clients and secret references | `app/services/tenant_context.py`, `secrets.py` | ✅ |
+| Admin API (own tenant only) | `app/api/admin.py` | ✅ |
+| Mock IdP | `mock_idp/` | ✅ dev/test only |
+| Webhook ingestion (signed, replay-protected, persisted before ack) | `app/webhooks/`, `app/api/webhooks.py` | ✅ |
+| Durable event inbox | `app/repositories/webhook_events.py`, migration `0004` | ✅ |
+| Background worker (SKIP LOCKED claiming, leases) | `app/worker/` | ✅ |
 | Mock CRM / mock CMS / admin guard | `mock_crm/`, `mock_internal/`, `mock_common/` | ✅ |
-| Tenants, OIDC auth, RBAC | — | 🚧 M5 |
-| Webhooks, durable job queue, DLQ, replay | — | 🚧 M6–7 |
+| Automatic retries with backoff, dead-letter, manual replay | — | 🚧 M7 |
 | React monitoring dashboard | — | 🚧 M8 |
 
 ## Separation of responsibilities
@@ -169,7 +176,18 @@ authentication in M5.
 
 ### Concurrency lock lifecycle
 
-Implemented in `PostgresAdvisorySyncLocks.hold(tenant_id, crm_account_id)`:
+> **Revised in M6.** M4 used `pg_advisory_xact_lock`, which kept the lock
+> connection "idle in transaction" for the whole sync, including its HTTP calls.
+> M6 switched to a **session-level** lock on an AUTOCOMMIT connection, so no
+> transaction stays open (verified with `pg_stat_activity` in tests and on the
+> live stack). The table below describes the original M4 design. The current steps are:
+> autocommit connection → `SET lock_timeout` → `pg_advisory_lock(key)` →
+> `SET idle_session_timeout` (backstop) → sync → `pg_advisory_unlock(key)` +
+> `RESET` → pool. If unlock fails or returns false, the connection is
+> **invalidated** (closed, which releases the lock) instead of pooled. See
+> `app/services/locks.py`.
+
+Original M4 implementation (`pg_advisory_xact_lock`), kept for reference:
 
 | # | Step | On failure |
 |---|---|---|
@@ -181,13 +199,15 @@ Implemented in `PostgresAdvisorySyncLocks.hold(tenant_id, crm_account_id)`:
 | 6 | Return the connection to the pool | — |
 | — | Process crash / network loss | the server ends the session and releases the lock (tested with `pg_terminate_backend`) |
 
-Why transaction-scoped instead of session-scoped `pg_advisory_lock`: there's
-no explicit unlock to forget, and a pooled connection can never be handed back
-still holding a lock.
+M4 chose transaction-scoped locks because there's no explicit unlock to forget.
+M6 kept that safety property in a different way: any doubt about the unlock
+means the connection is closed rather than pooled (tested by killing the lock
+session mid-sync).
 
-The idle-in-transaction backstop reclaims locks from a hung process. It is
-deliberately set to at least 2× the computed worst-case sync duration
-(`worst_case_sync_seconds`) so it can't fire during a legitimate sync.
+The server-side backstop (now `idle_session_timeout`) reclaims locks from a
+hung process. It is deliberately set to at least 2× the computed worst-case
+sync duration (`worst_case_sync_seconds`) so it can't fire during a legitimate
+sync. A test holds a lock past a 1 s backstop and confirms the server frees it.
 
 **Evidence:** `tests/integration/test_pg_locks.py` (4 separate OS processes:
 critical sections never overlap and are strictly serialised; different
@@ -206,3 +226,144 @@ lock statement replaced by a no-op, both tests fail.
 | `GET /sync/history` while DB down | HTTP 503 `{"detail": "Sync history storage unavailable"}` |
 | DB restarted / connections killed | next checkout reconnects (`pool_pre_ping`) |
 | `/health/ready` | 503 when the DB doesn't answer `SELECT 1`. `/health` (liveness) is unaffected |
+
+## Multi-tenancy and authentication (Milestone 5)
+
+```
+ Bearer JWT ─▶ get_principal ─▶ TokenVerifier (JWKS cache) ─▶ tenants table (exists + active)
+                    │
+                    ▼  Principal{subject, tenant_id, roles, permissions}
+              require(Permission.X) ─▶ route handler ─▶ service(principal.tenant_id, …)
+                                                          │
+             TenantConnectionProvider ◀───────────────────┤  per-tenant CRMClient + InternalSystemClient
+               └─ tenant_integrations row + EnvSecretResolver (env:IL_<TENANT>__<NAME>)
+             DbMappingProvider ◀──────────────────────────┘  active tenant_mapping_configs version
+```
+
+New tables (migration `0002`, additive): `tenants`, `tenant_integrations`
+(connection URLs and **secret references**, operator-managed),
+`tenant_mapping_configs` (append-only versions; active = highest). FK
+`sync_records.tenant_id → tenants.id` (backfilled, added `NOT VALID` then validated).
+Migration `0003` normalises CHECK constraint names (see ED-023).
+
+Each tenant has its own CRM org and CMS instance. In compose: Meridian →
+`mock-crm`/`mock-cms`, Harbor → `mock-crm-harbor`/`mock-cms-harbor`.
+Clients are cached per (tenant, config + secret fingerprint), so rotating a
+secret or editing a connection rebuilds the clients automatically.
+
+Static clients (`AccountSyncService(crm=…, destination=…)`) remain supported
+for single-tenant tests. In the database-less fallback, tenants are seeded in
+memory from `seed/dev_tenants.json`.
+
+## Concurrency lock: lost-lock mitigation (strategy; not yet implemented)
+
+**The edge case (M4 risk 2).** The advisory lock lives on a dedicated
+connection. If that connection ends mid-sync (the
+`idle_in_transaction_session_timeout` backstop fires, an admin runs
+`pg_terminate_backend`, a network partition, a database failover), PostgreSQL
+releases the lock while the original worker keeps running. A second worker
+can then take the lock, and two workers may write the same destination record.
+The backstop is set to at least 2× the worst-case sync duration, so the
+timeout path needs a hung process. The other paths remain.
+
+**Why the lock alone can't fix this.** No lock that can expire (lease, session
+or timeout) is safe on its own: a paused process can always resume after
+losing it. The standard remedy is to make the *resource* reject stale writers
+(fencing), with the lock as an efficiency measure.
+
+**Mitigation, in order of value per unit of complexity:**
+
+| # | Measure | Closes | Cost |
+|---|---|---|---|
+| 1 | **Lock-liveness check before every destination write.** On the lock connection, run `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND granted AND pid = pg_backend_pid()`. If the connection is dead or the lock isn't held, abort with retryable `sync_lock_lost` before writing. | every case where the lock was lost *before* the write starts | ~25 lines in `locks.py` (a `still_held()` method) and two calls in `_load`. No schema change |
+| 2 | **Optimistic concurrency at the destination (fencing).** The CMS exposes a per-customer `version`/ETag. Sync reads it, then PATCHes with `If-Match`. A `412` means someone else wrote: re-read and re-diff once, else record retryable `destination_conflict`. Creates are already fenced by the unique `external_crm_id` plus the idempotency key. | the residual race between check 1 and the write, and also writes from Meridian staff in the same window | mock CMS: `version` field + `If-Match` handling. Client: header plus a 412 error type. Service: one bounded re-diff |
+| 3 | **Observability.** Log and metric when lock acquisition waits, the lock hold time approaches the backstop, or `sync_lock_lost` fires. Alert on PostgreSQL "terminating connection due to idle-in-transaction timeout". | detection | small |
+
+Not recommended: a fencing-token table in our own database. It can stop a stale
+worker writing *history*, but not writing the *destination*, which is where
+the damage happens.
+
+**Plan:** implement 1 and 3 in Milestone 7 (failure recovery), where the
+worker loop already handles retryable outcomes. Implement 2 when the
+destination supports conditional writes (most production APIs, including
+Salesforce, expose ETags or version fields). With 2 in place the lock is purely
+a performance optimisation and correctness no longer depends on it.
+
+## Webhooks and background processing (Milestone 6)
+
+```
+ CRM (per tenant)                       IntegrationLab API                         PostgreSQL               Worker x N
+ ────────────────                       ──────────────────                         ──────────               ──────────
+ account updated
+ POST /webhooks/crm/{tenant} ────────▶  1. read raw body (≤ 64 KiB)
+   X-IntegrationLab-Signature:          2. tenant + integration → webhook secret(s)
+   t=<unix>,v1=<hmac>                      (unknown tenant / no secret ≡ bad signature → 401)
+                                        3. HMAC-SHA256("{t}.{body}") constant-time
+                                        4. |now − t| ≤ 300 s, else 401 (replay)
+                                        5. validate envelope; payload tenant must match
+                                        6. INSERT … ON CONFLICT (tenant_id, source, event_id)
+                                           DO NOTHING ─────────────────────────────▶ webhook_events
+                                           COMMIT                                    status=pending
+                      ◀──────────────── 7. 202 accepted | 200 duplicate | 409 conflict
+                                                                                    ▲   claim (short txn):
+                                                                                    │   SELECT … FOR UPDATE
+                                                                                    │   SKIP LOCKED → UPDATE
+                                                                                    │   status=processing,
+                                                                                    │   claim_token, lease
+                                                                                    │   COMMIT ─────────────▶ AccountSyncService
+                                                                                    │                        (advisory lock,
+                                                                                    │                         CRM/CMS HTTP, history)
+                                                                                    └── complete (short txn,
+                                                                                        fenced by claim_token):
+                                                                                        succeeded | failed + error
+```
+
+**Inbox pattern.** The API only authenticates and persists. Processing
+happens in `python -m app.worker`, a separate process unrelated to FastAPI's
+request lifecycle (no `BackgroundTasks`). The sender gets a 2xx **only after
+COMMIT**. If the database is unavailable it gets 503 and retries.
+
+### Table `webhook_events` (migration `0004`)
+
+| Column | Purpose |
+|---|---|
+| `id` uuid PK. `tenant_id` FK. `source` ('crm'). `event_id` (provider id) | **`UNIQUE (tenant_id, source, event_id)`**: durable, tenant-scoped idempotency |
+| `event_type`, `crm_account_id`, `occurred_at`, `signed_at`, `received_at` | what/when. `signed_at` is the verified signature timestamp |
+| `payload` jsonb | **allowlisted envelope only** (`event_id`, `event_type`, `occurred_at`, `account_id`). Never headers, signatures, secrets or extra fields |
+| `payload_sha256` | hash of the raw body: same `event_id` + same body = duplicate, different body = 409 |
+| `status` | `pending → processing → succeeded \| failed`. `ignored` for unsupported types |
+| `attempts` | number of claims (bounds crash loops via `WORKER_MAX_ATTEMPTS`) |
+| `available_at` | earliest claim time (M7 backoff will set it) |
+| `claim_token`, `claimed_by`, `claimed_at`, `lease_expires_at` | lease. CHECK: `processing ⇔ claim_token & lease set` |
+| `processed_at`, `last_error_code/_message/_retryable`, `sync_record_id` (FK) | outcome, linked to the resulting `sync_records` row |
+
+Indexes: partial `(available_at, received_at) WHERE status='pending'` (claim),
+partial `(lease_expires_at) WHERE status='processing'` (crash recovery),
+`(tenant_id, received_at DESC)` (listing). `tenant_integrations` gained
+`webhook_secret_ref` / `webhook_secret_previous_ref` (rotation).
+
+### Worker guarantees
+
+| Concern | Mechanism | Evidence |
+|---|---|---|
+| Two workers never take the same event | `FOR UPDATE SKIP LOCKED` in the claim | 4 OS processes × 30 events: every event `attempts = 1`. 8 threads × 40 claims: disjoint. Removing SKIP LOCKED makes both tests fail |
+| No transaction during HTTP | claim and complete are separate short transactions. Lock connection is idle, not in a transaction | `pg_stat_activity` probed at every outbound HTTP request: 0 idle-in-transaction. Reverting the lock makes it fail |
+| Worker crash | lease expires → reclaimed by any worker (`attempts + 1`) | real `SIGKILL` mid-event, then recovery by another worker |
+| Crash loops | at `attempts ≥ WORKER_MAX_ATTEMPTS` an expired event becomes `failed / worker_attempts_exhausted` | tested |
+| Stale worker after lease loss | completion requires the matching `claim_token` | stale completion while the new owner holds the lease is rejected (mutation-tested) |
+| DB down at claim | worker logs, backs off (≤ 30 s), keeps running | tested |
+| DB down at completion | event stays `processing`, is reclaimed after the lease, and re-runs idempotently (`unchanged`) | tested |
+| Same-account events | per-account advisory lock (M4) serialises them | 30 events / 2 accounts / 4 processes → exactly 2 `created`, 28 `unchanged` |
+| Bounded execution | client timeouts + bounded retries. Lease ≥ worst-case + lock wait (startup check). Small batches. SIGTERM finishes the current event | tested |
+| Restarts | events are rows. Nothing is held in memory | new process drains events written before an engine/process restart. Live: API + DB container restart with workers stopped |
+
+### Designed for Milestone 7 (not implemented)
+
+A processing failure is currently a terminal `failed` with
+`last_error_retryable` recorded. M7 will:
+- turn retryable failures into `pending` with `available_at = now() + backoff(attempts)`;
+- add a `dead_letter` status after a bounded number of attempts;
+- add an authorized replay endpoint that moves `failed`/`dead_letter` back to `pending`.
+
+The claim query already honours `available_at`. No schema change is needed
+beyond widening the status CHECK.

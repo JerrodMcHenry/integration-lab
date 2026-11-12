@@ -1,0 +1,33 @@
+{
+  "_comment": "Development tenants. URLs accept ${NAME:-default}. Secret refs name env vars in each tenant's own IL_<TENANT>__ namespace; values live in .env, never here.",
+  "tenants": [
+    {
+      "id": "meridian",
+      "display_name": "Meridian Capital",
+      "integration": {
+        "crm_base_url": "${SEED_MERIDIAN_CRM_URL:-http://127.0.0.1:8001}",
+        "crm_token_url": "${SEED_MERIDIAN_CRM_URL:-http://127.0.0.1:8001}/oauth/token",
+        "crm_client_id": "integrationlab-dev",
+        "crm_client_secret_ref": "env:IL_MERIDIAN__CRM_CLIENT_SECRET",
+        "cms_base_url": "${SEED_MERIDIAN_CMS_URL:-http://127.0.0.1:8002}",
+        "cms_api_key_ref": "env:IL_MERIDIAN__CMS_API_KEY",
+        "webhook_secret_ref": "env:IL_MERIDIAN__WEBHOOK_SECRET"
+      },
+      "mapping_file": "meridian.json"
+    },
+    {
+      "id": "harbor",
+      "display_name": "Harborview Trust",
+      "integration": {
+        "crm_base_url": "${SEED_HARBOR_CRM_URL:-http://127.0.0.1:8011}",
+        "crm_token_url": "${SEED_HARBOR_CRM_URL:-http://127.0.0.1:8011}/oauth/token",
+        "crm_client_id": "harbor-dev",
+        "crm_client_secret_ref": "env:IL_HARBOR__CRM_CLIENT_SECRET",
+        "cms_base_url": "${SEED_HARBOR_CMS_URL:-http://127.0.0.1:8012}",
+        "cms_api_key_ref": "env:IL_HARBOR__CMS_API_KEY",
+        "webhook_secret_ref": "env:IL_HARBOR__WEBHOOK_SECRET"
+      },
+      "mapping_file": "harbor.json"
+    }
+  ]
+}

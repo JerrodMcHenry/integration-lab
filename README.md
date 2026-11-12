@@ -5,13 +5,17 @@ customer accounts for the fictional financial-services firm **Meridian
 Capital** from a Salesforce-style CRM into Meridian's internal Customer
 Management System.
 
-> **Status: work in progress — Milestone 4 of 10 complete.** This is not
-> production software: the API has no authentication yet (M5). See
+> **Status: work in progress — Milestone 6 of 10 complete.** This is not
+> production software (see the remaining risks in [docs/security.md](docs/security.md)). See
 > [docs/architecture.md](docs/architecture.md) for what is implemented and
 > what is planned.
 
 ## What works today
 
+- **Event-driven sync:** the CRM sends signed webhooks, which are verified
+  (HMAC over the raw body, 5-minute replay window), persisted before
+  acknowledgement, deduplicated per tenant, and processed by background workers
+  using `FOR UPDATE SKIP LOCKED` with crash-safe leases.
 - **On-demand account sync** (`POST /sync/accounts/{id}`): CRM → mapping →
   internal CMS, with create, update (changed fields only), unchanged
   (no write) and stale-skip outcomes.
@@ -25,7 +29,12 @@ Management System.
   syncs per (tenant, account) across workers and hosts.
 - **Resilient clients:** OAuth 2.0 client credentials (CRM), API key (CMS),
   typed errors, bounded jittered retries, idempotent creates.
-- **Two mock services** with fault injection. Admin routes are disabled in production.
+- **Multi-tenant with OIDC + RBAC:** JWT access tokens are verified (signature,
+  issuer, audience, expiry, `typ`), the tenant comes only from the token, and
+  viewer/operator/admin permissions are enforced. Each tenant has its own CRM/CMS
+  connections, secrets and versioned mappings.
+- **Mock services** for two tenants' CRMs and CMSs plus a dev-only OIDC
+  provider. Admin routes are disabled, and the mock IdP refuses to start, in production/staging.
 
 ## Run everything with Docker Compose
 
@@ -33,15 +42,28 @@ Management System.
 cp .env.example .env
 # set POSTGRES_PASSWORD in .env, e.g. the output of: openssl rand -hex 24
 
-docker compose up -d --build --wait   # db → migrate (alembic upgrade head) → mocks → api (4 workers)
-curl -X POST localhost:8000/sync/accounts/SF-1002
-curl localhost:8000/sync/history
+docker compose up -d --build --wait   # db → migrate + seed → mocks + IdP → api (4 procs) + worker x2
+
+# Get a token from the mock IdP (users: meridian-{admin,operator,viewer}, harbor-{admin,operator})
+TOKEN=$(curl -s localhost:8090/oauth/token -d grant_type=password -d client_id=integrationlab-cli \
+  -d username=meridian-operator -d password=dev-only-password | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+curl -X POST -H "Authorization: Bearer $TOKEN" localhost:8000/sync/accounts/SF-1002
+curl -H "Authorization: Bearer $TOKEN" localhost:8000/sync/history
+curl -H "Authorization: Bearer $TOKEN" localhost:8000/me
 curl localhost:8000/health/ready
+
+# Event-driven: change an account in Meridian's CRM; the CRM sends a signed webhook, a worker syncs it
+CRM=$(curl -s -u integrationlab-dev:dev-only-secret -d grant_type=client_credentials localhost:8001/oauth/token \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+curl -X PATCH -H "Authorization: Bearer $CRM" -H 'Content-Type: application/json' \
+  -d '{"AnnualRevenue": 9000000}' localhost:8001/crm/accounts/SF-1002
+curl -H "Authorization: Bearer $TOKEN" localhost:8000/webhooks/events      # -> succeeded
 docker compose stop                   # stop; data is kept in the integrationlab_pgdata volume
 ```
 
-All ports are bound to `127.0.0.1` only: API 8000, mock CRM 8001, mock CMS
-8002, PostgreSQL 5434. OpenAPI docs: http://localhost:8000/docs
+All ports are bound to `127.0.0.1` only: API 8000, IdP 8090, Meridian CRM/CMS
+8001/8002, Harbor CRM/CMS 8011/8012, PostgreSQL 5434. OpenAPI docs: http://localhost:8000/docs
 
 ## Local development (app on the host, DB in Docker)
 
@@ -52,10 +74,13 @@ cp .env.example .env                  # set POSTGRES_PASSWORD
 
 docker compose up -d --wait db
 alembic upgrade head                  # uses DATABASE_URL from .env
+python -m app.cli seed-dev            # insert dev tenants if absent (never overwrites)
 
-uvicorn mock_crm.main:app --port 8001        # terminal 1
-uvicorn mock_internal.main:app --port 8002   # terminal 2
-uvicorn app.main:app --port 8000             # terminal 3
+uvicorn mock_idp.main:app --port 8090        # identity provider
+uvicorn mock_crm.main:app --port 8001        # Meridian CRM
+uvicorn mock_internal.main:app --port 8002   # Meridian CMS
+uvicorn app.main:app --port 8000
+python -m app.worker                         # background event worker
 ```
 
 Without `DATABASE_URL`, the app falls back to in-memory history and
@@ -91,11 +116,12 @@ by an advisory lock.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md): includes persistence, schema and the lock lifecycle
+- [Architecture](docs/architecture.md): includes persistence, the lock lifecycle, multi-tenancy and the lost-lock mitigation
+- [API contracts](docs/api-contracts.md)
 - [Customer requirements](docs/customer-requirements.md)
 - [Integration guide](docs/integration-guide.md)
-- [Security](docs/security.md)
+- [Security](docs/security.md): authentication flow, permission model, isolation, remaining risks
 - [Troubleshooting](docs/troubleshooting.md)
 - [Engineering decisions](docs/engineering-decisions.md)
 
-API contracts and the demo script will be added as the features they describe are built.
+The demo script will be added with the dashboard.

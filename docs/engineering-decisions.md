@@ -163,3 +163,111 @@ database name ends in `_test`, create it if missing, migrate forward, and
 `TRUNCATE sync_records` between tests. They skip when PostgreSQL is
 unreachable, unless `REQUIRE_POSTGRES=1`.
 **Why:** Real-database coverage without any chance of touching development data.
+
+## ED-019 — Mock OIDC provider instead of Keycloak (for now)
+**Decision:** A small `mock_idp` service implementing discovery, JWKS and RS256
+RFC 9068 access tokens. The API's verifier is generic OIDC/JWT.
+**Why:** Keycloak adds ~500 MB, slow startup and realm-config complexity to a
+laptop stack (Docker on the dev machine was already flaky in M4). The
+security-relevant logic (verification, tenant resolution, RBAC) is in the API
+and is the same for any IdP.
+**Tradeoff:** No authorization code + PKCE yet. M8's browser dashboard will
+need it, either added to the mock or by switching compose to Keycloak.
+The mock refuses to start in production/staging.
+
+## ED-020 — Validate typ=at+jwt, allowlist asymmetric algorithms, cap lifetime
+**Decision:** Reject tokens whose header `typ` isn't `at+jwt`, whose `alg`
+isn't in an asymmetric allowlist, or whose `exp - iat` exceeds 1 h.
+**Why:** `typ` stops an ID token (same issuer, same keys) from being used as an
+access token. The allowlist blocks `alg=none` and HS256 key-confusion
+(tested). The lifetime cap limits damage from a misconfigured IdP issuing
+long-lived tokens.
+
+## ED-021 — Permissions, not roles, in endpoints; no cross-tenant role
+**Decision:** Three tenant-scoped roles map to five permissions in one table.
+Endpoints declare the permission they need. There is no platform super-admin
+in the API.
+**Why:** One place to change policy, and no API path where a single token
+spans tenants. Platform operations use the CLI/DB with infrastructure access.
+
+## ED-022 — Per-tenant connections and secret references; operator-managed
+**Decision:** `tenant_integrations` stores URLs and secret *references*.
+Secrets resolve from env vars in a tenant-specific namespace. The API can read
+(redacted) but not modify connection settings. Each tenant gets its own client
+instances and OAuth token cache.
+**Why:** Prevents cross-tenant credential use, SSRF via tenant-supplied URLs,
+and secrets at rest in the database. Fingerprinted client caching means
+rotating a secret rebuilds clients with no restart.
+**Note:** a prefix-based namespace check was found to be bypassable
+(`a` vs `a-b`) and replaced by delimiter parsing (regression-tested).
+
+## ED-023 — Fix doubled CHECK constraint names with a forward migration
+**Decision:** `0003` renames constraints that `0001` created with the naming
+convention applied twice (`ck_t_ck_t_x`, some truncated with a hash suffix).
+`0002` was corrected with `op.f()` before it reached any non-test database.
+`0001` was left unchanged because it's applied to the dev database. A test
+now asserts that database CHECK names equal the model's names.
+**Why:** Applied migrations are history. A forward, idempotent, rename-only
+migration fixes every database without data risk.
+
+## ED-024 — Mapping configuration moves to the database, versioned
+**Decision:** Mappings live in `tenant_mapping_configs` (append-only, server-
+assigned versions, `created_by` from the token's `sub`). Files in
+`app/mapping/configs/` are now only seed input.
+**Why:** Tenant admins can publish changes via the API without a restart, with
+history and attribution. A concurrent publish produces a 409, not a silent overwrite (tested).
+
+## ED-025 — Session-level advisory lock on an autocommit connection (revises ED-013)
+**Decision:** Replace `pg_advisory_xact_lock` with `pg_advisory_lock` on an
+AUTOCOMMIT connection, a `SET idle_session_timeout` backstop, explicit unlock,
+and **invalidate the connection on any unlock doubt**.
+**Why:** The M6 constraint "no transactions open during external HTTP calls".
+The M4 lock left an empty transaction open for the whole sync (confirmed with
+`pg_stat_activity` before the change).
+**Tradeoff:** Relies on correct unlock handling (a stale lock on a pooled
+connection would be a bug). Mitigated by invalidating rather than pooling
+whenever unlock fails or returns false, and covered by a test that kills the
+lock session mid-sync. Requires PostgreSQL ≥ 14 for `idle_session_timeout`.
+
+## ED-026 — Inbox pattern: persist, acknowledge, process asynchronously
+**Decision:** The webhook endpoint authenticates, validates and inserts, then
+responds. Workers process later.
+**Why:** The CRM gets a fast, honest acknowledgement (2xx only after COMMIT).
+CRM/CMS latency and outages never cause webhook timeouts. Events survive
+restarts. Processing scales independently.
+**Alternative rejected:** FastAPI `BackgroundTasks` or in-memory queues:
+work is lost on restart or crash.
+
+## ED-027 — Signature scheme `t=…,v1=HMAC-SHA256("{t}.{raw_body}")`
+**Decision:** A Stripe-style header with the timestamp inside the signed
+message, multiple `v1` values, and an optional previous secret for rotation.
+Verification happens over the raw bytes before parsing, in constant time. The
+replay window is checked only after the signature.
+**Why:** A widely understood design. The signed timestamp bounds the replay
+window, and inside the window the `event_id` unique constraint stops replays.
+
+## ED-028 — Tenant in the URL is a routing hint, authenticated by the tenant's secret
+**Decision:** `POST /webhooks/crm/{tenant_id}`. The event is attributed to the
+tenant only if the HMAC verifies with *that tenant's* secret. Unknown tenant,
+missing secret and bad signature all return the same 401. A `tenant_id` in the
+payload must match or the event is rejected.
+**Why:** Avoids trusting payload content for identity, and gives no oracle for
+tenant enumeration. Signing with one tenant's key never authenticates as another (tested).
+
+## ED-029 — Leases + claim tokens instead of long-held row locks
+**Decision:** Claims commit immediately and mark the row `processing` with a
+lease and a random `claim_token`. Completion is conditional on the token. An
+expired lease makes the row claimable again, counting `attempts`.
+**Why:** Holding `FOR UPDATE` across processing would keep a transaction (and
+row locks) open during HTTP calls. Leases give crash recovery without that,
+and the token fences stale workers.
+**Tradeoff:** Recovery latency equals the lease (default ≈ 214 s). Processing
+is at-least-once, which is safe because the sync is idempotent (diff-then-patch).
+
+## ED-030 — Acknowledgement semantics
+202 for a new (or ignored-type) event, 200 for a duplicate with the same body,
+409 for a reused `event_id` with a different body, 401 for authentication or
+replay failures, 403 for a suspended tenant, 413 for oversized bodies, 422
+for an authenticated but invalid payload, 503 for a store outage (sender retries).
+Unsupported event types are acknowledged and stored as `ignored`, so a provider
+doesn't retry them forever.

@@ -28,6 +28,19 @@ The DB isn't running or `TEST_DATABASE_URL` is wrong. Start it with
 Intentional. The integration fixtures truncate tables. Point
 `TEST_DATABASE_URL` at `integrationlab_test`.
 
+## Authentication
+
+| Symptom | Cause / action |
+|---|---|
+| 401 `token expired` | mock IdP tokens last 15 min. Request a new one |
+| 401 `token signed with an unknown key` | the mock IdP restarted (new in-memory keys) or rotated keys less than 30 s ago. Get a new token / retry after 30 s |
+| 401 `token issuer invalid` | `OIDC_ISSUER` must exactly equal the token's `iss` (compose: `http://localhost:8090`, because tokens are requested from the host) |
+| 401 `token is not an access token` | the token's `typ` header isn't `at+jwt` (e.g. an ID token was sent) |
+| 403 `missing permission …` | the role lacks the permission. See the matrix in security.md |
+| 403 `tenant is not provisioned` / `suspended` | no active `tenants` row for the token's `tenant_id`. Run `python -m app.cli seed-dev` (dev) |
+| 503 `identity provider unavailable` | API can't fetch JWKS. Check `OIDC_JWKS_URL` / that mock-idp is running |
+| 500 `tenant_connection_invalid` | tenant has no `tenant_integrations` row, or a referenced `IL_<TENANT>__…` env var is missing |
+
 ## Sync results
 
 | Symptom | Meaning | Action |
@@ -54,4 +67,32 @@ docker compose exec db psql -U integrationlab -d integrationlab \
 
 # Applied migration
 docker compose exec db psql -U integrationlab -d integrationlab -c "select * from alembic_version"
+```
+
+
+## Webhooks and worker
+
+| Symptom | Cause / action |
+|---|---|
+| 401 `signature verification failed` | wrong secret, body changed after signing (sign the exact bytes you send), wrong tenant in the URL, or `IL_<TENANT>__WEBHOOK_SECRET` not set on the API (logged as `webhook.secret_unavailable`) |
+| 401 `signature timestamp outside tolerance` | sender clock skew or a delayed/replayed request. Check NTP and `WEBHOOK_TOLERANCE_SECONDS` |
+| 409 conflict | the sender reused an `event_id` for different content |
+| 503 from the webhook endpoint | DB unreachable. The event was **not** stored; the sender must retry |
+| events stay `pending` | no worker running (`docker compose ps worker`), or the worker can't reach the DB (logs `worker.claim_failed`, backing off) |
+| events stuck `processing` | a worker died mid-event. They're reclaimed automatically when `lease_expires_at` passes (default ≈ 214 s) |
+| `failed / worker_attempts_exhausted` | the event was claimed `WORKER_MAX_ATTEMPTS` times without completing (repeated crashes). Investigate worker logs. Replay arrives in M7 |
+| `failed / history_not_persisted` | sync ran but its record couldn't be saved (DB issue). Retryable |
+| uneven work across workers | one worker claimed a whole batch. Lower `WORKER_BATCH_SIZE` |
+
+```bash
+# Queue overview
+docker compose exec db psql -U integrationlab -d integrationlab -c \
+  "select tenant_id, status, count(*), max(attempts) from webhook_events group by 1,2 order by 1,2"
+# In-flight leases
+docker compose exec db psql -U integrationlab -d integrationlab -c \
+  "select event_id, claimed_by, attempts, lease_expires_at from webhook_events where status='processing'"
+# Recent failures
+docker compose exec db psql -U integrationlab -d integrationlab -c \
+  "select event_id, crm_account_id, last_error_code, last_error_retryable from webhook_events where status='failed' order by received_at desc limit 20"
+docker compose logs -f worker
 ```

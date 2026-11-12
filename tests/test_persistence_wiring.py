@@ -69,13 +69,14 @@ def test_history_failure_raises_with_record_and_logs_it(crm_client, cms_client, 
 
 
 @pytest.fixture
-def api_with():
+def api_with(auth):
     def make(svc):
         app.dependency_overrides[get_sync_service] = lambda: svc
         app.dependency_overrides[get_sync_history] = lambda: InMemorySyncHistoryRepository()
-        return TestClient(app)
+        return TestClient(app, headers=auth.headers("operator"))
     yield make
-    app.dependency_overrides.clear()
+    app.dependency_overrides.pop(get_sync_service, None)
+    app.dependency_overrides.pop(get_sync_history, None)
 
 
 @pytest.mark.parametrize("exc, status", [(LockTimeoutError("busy"), 409), (LockUnavailableError("down"), 503)])

@@ -82,3 +82,33 @@ def write_then_exit(url: str, tenant: str, account: str) -> str:
     PostgresSyncHistoryRepository(engine).add(record)
     engine.dispose()
     return str(record.id)
+
+
+def run_event_worker(url: str, secrets: dict, worker_id: str, max_seconds: float, barrier_path: str,
+                     lease: float = 30.0) -> dict:
+    """A full worker process: claims and processes events until idle-timeout."""
+    from app.db.engine import build_engine
+    from tests.integration.conftest import db_settings
+    from tests.integration.webhook_helpers import build_service, build_worker
+
+    engine = build_engine(db_settings(url, lock_timeout_seconds=30), application_name=f"worker-{worker_id}")
+    worker = build_worker(engine, build_service(engine, secrets=secrets), lease=lease, worker_id=worker_id)
+    while not os.path.exists(barrier_path):
+        time.sleep(0.005)
+    stats = worker.run(max_seconds=max_seconds)
+    engine.dispose()
+    return {"worker": worker_id, "pid": os.getpid(), "claimed": stats.claimed, "succeeded": stats.succeeded,
+            "failed": stats.failed, "lease_lost": stats.lease_lost}
+
+
+def claim_and_hang(url: str, lease: float, ready_path: str) -> None:
+    """Claims one event, then hangs mid-processing so the parent can kill -9 it."""
+    from app.db.engine import build_engine
+    from app.repositories.webhook_events import PostgresWebhookEventRepository
+    from tests.integration.conftest import db_settings
+
+    engine = build_engine(db_settings(url), application_name="doomed-worker")
+    claimed = PostgresWebhookEventRepository(engine).claim("doomed-worker", batch=1, lease_seconds=lease,
+                                                           max_attempts=5)
+    open(ready_path, "w").write(str(len(claimed)))
+    time.sleep(3600)  # "processing" forever, until SIGKILL

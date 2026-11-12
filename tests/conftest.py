@@ -110,3 +110,36 @@ def crm_patch(crm_app: TestClient, account_id: str, **fields) -> dict:
 
 def cms_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {CMS_KEY}"}
+
+
+# --------------------------------------------------------------------------- #
+# Authentication (Milestone 5)
+# --------------------------------------------------------------------------- #
+from app.api import deps as api_deps  # noqa: E402
+from app.auth import dependencies as auth_deps  # noqa: E402
+from tests.auth_helpers import TestIdP, test_tenants  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+def idp() -> TestIdP:
+    return TestIdP()
+
+
+@pytest.fixture
+def tenant_repo():
+    return test_tenants()
+
+
+@pytest.fixture
+def auth(idp, tenant_repo):
+    """Install the test IdP's verifier and the test tenant directory on the app."""
+    from app.main import app
+
+    verifier = idp.verifier()
+    app.dependency_overrides[auth_deps.get_token_verifier] = lambda: verifier
+    app.dependency_overrides[auth_deps.get_tenant_repository] = lambda: tenant_repo
+    app.dependency_overrides[api_deps.get_tenant_repository] = lambda: tenant_repo
+    yield idp
+    for dep in (auth_deps.get_token_verifier, auth_deps.get_tenant_repository,
+                api_deps.get_tenant_repository):
+        app.dependency_overrides.pop(dep, None)

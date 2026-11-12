@@ -18,8 +18,22 @@ and calls its REST API with a bearer token.
 | `CRM_BACKOFF_BASE_SECONDS` | `0.5` | First backoff ceiling, doubles per attempt |
 | `CRM_BACKOFF_MAX_SECONDS` | `4` | Backoff cap |
 
-CRM credentials are process-wide for now. Per-tenant credentials move to the
-database in M4/M5.
+Since M5, **each tenant has its own CRM connection** in `tenant_integrations`
+(URL, token URL, client id, and a *reference* to the client secret). The
+`CRM_*` variables above now provide only the timeout/retry policy for every tenant,
+plus the credentials for the single-tenant fallback.
+
+### Onboarding a tenant (operator task)
+
+1. Add the tenant to `seed/dev_tenants.json` (dev) or insert rows into
+   `tenants` and `tenant_integrations` (other environments). Tenant ids:
+   lowercase letters/digits separated by single hyphens.
+2. Provide secrets as env vars in the tenant's namespace:
+   `IL_<TENANT>__CRM_CLIENT_SECRET`, `IL_<TENANT>__CMS_API_KEY` (`-` → `_` in
+   the tenant segment, `__` before the name). The integration row references them as
+   `env:IL_<TENANT>__CRM_CLIENT_SECRET`. A tenant can't reference another tenant's namespace.
+3. Publish the first mapping (`PUT /admin/mapping` as the tenant's admin, or via seed).
+4. Configure the IdP to issue tokens with `tenant_id=<tenant>` and `roles`.
 
 ### Endpoints consumed
 
@@ -60,9 +74,11 @@ database in M4/M5.
 
 ## Field mapping configuration
 
-One JSON file per tenant in `app/mapping/configs/<tenant_id>.json` (directory
-overridable with `MAPPING_CONFIG_DIR`). See `meridian.json` and
-[customer-requirements.md](customer-requirements.md).
+Stored per tenant in the database (`tenant_mapping_configs`, versioned) and
+managed with `GET/PUT /admin/mapping` (admin role). The files in
+`app/mapping/configs/` (`meridian.json`, `harbor.json`) are seed input. See
+[customer-requirements.md](customer-requirements.md) and
+[api-contracts.md](api-contracts.md).
 
 ```json
 {"source": "AnnualRevenue", "target": "annual_revenue_usd", "required": false,
@@ -81,6 +97,8 @@ overridable with `MAPPING_CONFIG_DIR`). See `meridian.json` and
   mapping and every problem is listed in the error.
 
 ## Synchronization API
+
+All calls need `Authorization: Bearer <token>` (see [api-contracts.md](api-contracts.md)).
 
 | Method | Path | Result |
 |---|---|---|
@@ -154,3 +172,52 @@ with CRMClient() as crm:
         else:
             ...  # record a permanent failure
 ```
+
+
+## Receiving CRM webhooks (Milestone 6)
+
+Configure the CRM (per tenant) to POST account changes to:
+
+    https://<integrationlab-host>/webhooks/crm/<tenant_id>
+
+Signing (sender side):
+
+```python
+import hmac, hashlib, json, time
+body = json.dumps({"event_id": "evt_123", "event_type": "account.updated",
+                   "occurred_at": "2026-11-12T10:00:00Z", "data": {"account_id": "SF-1002"}}).encode()
+t = int(time.time())
+sig = hmac.new(secret.encode(), f"{t}.".encode() + body, hashlib.sha256).hexdigest()
+headers = {"Content-Type": "application/json", "X-IntegrationLab-Signature": f"t={t},v1={sig}"}
+# POST exactly `body` (the bytes that were signed)
+```
+
+- Retry on 5xx and network errors with the **same body and `event_id`** (re-sign
+  with a fresh `t`). Duplicates return 200 and don't cause extra processing.
+- Never reuse an `event_id` for different content (409).
+- The event only says *which* account changed. IntegrationLab re-reads the
+  account from the CRM, so events may arrive out of order or be coalesced safely.
+- Secret: `IL_<TENANT>__WEBHOOK_SECRET` (referenced by
+  `tenant_integrations.webhook_secret_ref`). To rotate: set the new secret, point
+  `webhook_secret_previous_ref` at the old one, switch the sender, then clear the previous ref.
+
+### Worker
+
+```bash
+python -m app.worker                      # run until SIGTERM (finishes current event)
+python -m app.worker --once               # one batch
+docker compose up -d --scale worker=4     # more workers; SKIP LOCKED shares the queue
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WORKER_BATCH_SIZE` | 10 | events claimed per round trip (lower = fairer spread across workers) |
+| `WORKER_POLL_INTERVAL_SECONDS` | 1 | idle poll interval |
+| `WORKER_LEASE_SECONDS` | 2 × worst case (≈ 214 s) | claim reservation. The worker refuses a value below the worst-case event duration |
+| `WORKER_MAX_ATTEMPTS` | 5 | claims per event before it is failed (`worker_attempts_exhausted`) |
+| `WEBHOOK_TOLERANCE_SECONDS` | 300 | replay window |
+| `WEBHOOK_MAX_BODY_BYTES` | 65536 | |
+
+The mock CRMs send webhooks automatically on `PATCH /crm/accounts/{id}`.
+`GET /_admin/webhooks` shows deliveries and
+`POST /_admin/webhooks/redeliver/{event_id}` resends one (dev only).

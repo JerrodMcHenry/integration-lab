@@ -8,7 +8,10 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
 
-from app.api.deps import get_current_tenant, get_sync_history, get_sync_service
+from app.api.deps import get_sync_history, get_sync_service
+from app.auth.dependencies import require
+from app.auth.permissions import Permission
+from app.auth.tokens import Principal
 from app.repositories.sync_history import SyncHistoryRepository
 from app.schemas.sync import SyncRecord, SyncStage, SyncStatus
 from app.services.account_sync import AccountSyncService, HistoryPersistenceError
@@ -32,6 +35,8 @@ def _http_status(record: SyncRecord) -> int:
         return 422
     if record.stage is SyncStage.INTERNAL:
         return 500
+    if err and err.code == "tenant_connection_invalid":
+        return 500
     if err and err.code.endswith("_timeout"):
         return 504
     return 502
@@ -42,6 +47,8 @@ def _http_status(record: SyncRecord) -> int:
     response_model=SyncRecord,
     responses={
         201: {"model": SyncRecord, "description": "Customer created in destination"},
+        401: {"description": "Missing, invalid or expired access token"},
+        403: {"description": "Token lacks sync:run, or tenant not provisioned/suspended"},
         404: {"model": SyncRecord, "description": "Account not found in CRM"},
         409: {"model": SyncRecord, "description": "Another sync of this account is still running (lock timeout)"},
         422: {"model": SyncRecord, "description": "Mapping or validation failure"},
@@ -50,15 +57,15 @@ def _http_status(record: SyncRecord) -> int:
               "history record could not be saved (header X-Sync-History-Persisted: false)"},
         504: {"model": SyncRecord, "description": "Upstream system timeout"},
     },
-    summary="Synchronize one CRM account into the internal customer system",
+    summary="Synchronize one CRM account into the internal customer system (requires sync:run)",
 )
 def sync_account(
     crm_account_id: CrmAccountId,
-    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    principal: Annotated[Principal, Depends(require(Permission.SYNC_RUN))],
     service: Annotated[AccountSyncService, Depends(get_sync_service)],
 ):
     try:
-        record = service.sync_account(tenant_id, crm_account_id)
+        record = service.sync_account(principal.tenant_id, crm_account_id)
     except HistoryPersistenceError as exc:
         # The destination may already have been updated; tell the caller exactly that.
         return JSONResponse(status_code=503, content=exc.record.model_dump(mode="json"),
@@ -67,24 +74,26 @@ def sync_account(
                         headers={"X-Sync-History-Persisted": "true"})
 
 
-@router.get("/history", response_model=list[SyncRecord], summary="Recent sync attempts for the tenant")
+@router.get("/history", response_model=list[SyncRecord],
+            summary="Recent sync attempts for the caller's tenant (requires history:read)")
 def list_history(
-    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    principal: Annotated[Principal, Depends(require(Permission.HISTORY_READ))],
     history: Annotated[SyncHistoryRepository, Depends(get_sync_history)],
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
     crm_account_id: str | None = None,
     status: SyncStatus | None = None,
 ):
-    return history.list_recent(tenant_id, limit=limit, crm_account_id=crm_account_id, status=status)
+    return history.list_recent(principal.tenant_id, limit=limit, crm_account_id=crm_account_id, status=status)
 
 
 @router.get("/history/{record_id}", response_model=SyncRecord)
 def get_history_record(
     record_id: UUID,
-    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    principal: Annotated[Principal, Depends(require(Permission.HISTORY_READ))],
     history: Annotated[SyncHistoryRepository, Depends(get_sync_history)],
 ):
-    record = history.get(tenant_id, record_id)
+    # Another tenant's record id returns 404, indistinguishable from a missing one.
+    record = history.get(principal.tenant_id, record_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Sync record not found")
     return record

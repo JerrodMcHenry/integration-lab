@@ -1,43 +1,177 @@
 # Security
 
-This document lists controls that are **implemented and tested**, followed by
-known gaps. It is not a claim of production readiness.
+This document describes controls that are **implemented and tested**,
+followed by known gaps. It is not a claim of production readiness.
 
-## Implemented
+## Authentication flow (OIDC / OAuth 2.0)
 
-| Control | Where | Test evidence |
+```
+ user / service                 Identity provider                    IntegrationLab API
+ ──────────────                 ─────────────────                    ──────────────────
+ 1. POST /oauth/token  ───────▶  authenticates the user or client
+                       ◀───────  RS256 JWT access token (RFC 9068)
+                                 header: alg, kid, typ=at+jwt
+                                 claims: iss, aud, sub, iat, nbf, exp, jti,
+                                         client_id, tenant_id, roles
+ 2. Authorization: Bearer <JWT>  ─────────────────────────────────▶  3. verify (app/auth/tokens.py)
+                                 4. GET /jwks (cached, 10 min) ◀────    a. alg ∈ allowlist (RS256…; never none/HS*)
+                                                                        b. typ == at+jwt (not an ID token)
+                                                                        c. kid → key from JWKS
+                                                                        d. signature
+                                                                        e. iss exact, aud contains integrationlab-api
+                                                                        f. exp / nbf / iat (30 s leeway),
+                                                                           lifetime ≤ 1 h, sub present
+                                                                        g. tenant_id well-formed, roles is a list
+                                                                     5. tenants table: tenant exists and is active
+                                                                     6. role → permissions; endpoint requires one
+                                                                     7. handler uses principal.tenant_id only
+```
+
+- **Tenant identity comes only from the verified `tenant_id` claim** and must
+  match an active row in `tenants`. Paths, query strings, headers and bodies
+  are never used for tenant identity (tested with `?tenant_id=`, `X-Tenant-ID`
+  and `X-Forwarded-Tenant`).
+- **JWKS:** fetched from `OIDC_JWKS_URL`, or discovered via
+  `{issuer}/.well-known/openid-configuration` (the discovery `issuer` must
+  match). Cached for `OIDC_JWKS_CACHE_SECONDS`. An unknown `kid` triggers a
+  refetch at most once every 30 s, so a flood of bogus `kid`s can't hammer the
+  IdP (tested). Key rotation works if the IdP publishes new keys before signing
+  with them, which standard IdPs do.
+- **Errors (RFC 6750):** 401 + `WWW-Authenticate: Bearer error="invalid_token"`
+  for a missing, invalid or expired token. 403 + `error="insufficient_scope"` for
+  a missing permission. 403 for an unknown or suspended tenant. 503 if the IdP's
+  keys can't be fetched (never a silent 401). Tokens are never logged (tested).
+
+### Identity provider
+
+`mock_idp/` is a **development and test** IdP. It implements discovery, JWKS,
+RS256 `at+jwt` access tokens, the `password` grant for named demo users and
+`client_credentials` for a tenant-bound service account, plus dev-only key
+rotation. It **refuses to start** when `APP_ENV` is production, prod or staging.
+It does not implement authorization code + PKCE, ID tokens, refresh tokens or
+userinfo. The API's verifier is IdP-agnostic: point `OIDC_ISSUER`,
+`OIDC_AUDIENCE` (and optionally `OIDC_JWKS_URL`, `OIDC_TENANT_CLAIM`,
+`OIDC_ROLES_CLAIM`) at Keycloak, Entra ID, Auth0 or Okta configured to emit
+`tenant_id` and `roles` claims.
+
+Demo users (password `dev-only-password`): `meridian-admin`,
+`meridian-operator`, `meridian-viewer`, `meridian-norole`, `harbor-admin`,
+`harbor-operator`.
+
+## Webhook authentication (Milestone 6)
+
+Inbound CRM webhooks don't use bearer tokens. Each request is authenticated
+by an HMAC over its **raw body** with the tenant's webhook secret:
+
+1. The tenant in the URL is only a hint. Its integration row supplies the
+   secret reference(s) (`env:IL_<TENANT>__WEBHOOK_SECRET`, plus an optional
+   previous secret for rotation), resolved through the same namespace-checked
+   resolver as the CRM credentials.
+2. `HMAC-SHA256(secret, "{t}.{raw body}")` is compared in constant time
+   against every `v1=` value. Unknown tenant, missing secret and bad signature
+   all return the identical 401 (no tenant-enumeration oracle).
+3. Only after the signature verifies: `|now − t| ≤ WEBHOOK_TOLERANCE_SECONDS`
+   (default 300 s). Inside the window, a replayed request has the same
+   `event_id` and is deduplicated by `UNIQUE (tenant_id, source, event_id)`.
+4. A `tenant_id` inside the payload is never trusted. If present and different
+   from the authenticated tenant, the event is rejected.
+5. Secrets and signatures are never logged or stored. `webhook_events.payload`
+   holds only an allowlisted envelope (tested against DB contents and logs, plus
+   a live check).
+
+## Permission model (RBAC)
+
+| Permission | viewer | operator | admin | Endpoints |
+|---|:-:|:-:|:-:|---|
+| `tenant:read` | ✅ | ✅ | ✅ | `GET /tenant` |
+| `history:read` | ✅ | ✅ | ✅ | `GET /sync/history`, `GET /sync/history/{id}`, `GET /webhooks/events`, `GET /webhooks/events/{id}` |
+| `sync:run` | | ✅ | ✅ | `POST /sync/accounts/{id}`, `POST /accounts` (legacy) |
+| `config:read` | | | ✅ | `GET /admin/integration`, `GET /admin/mapping`, `GET /admin/mapping/versions` |
+| `config:write` | | | ✅ | `PUT /admin/mapping` |
+| (authenticated) | ✅ | ✅ | ✅ | `GET /me` |
+| (HMAC) | | | | `POST /webhooks/crm/{tenant_id}`, authenticated by tenant webhook signature |
+| (public) | | | | `GET /health`, `GET /health/ready`, `/docs` and `/openapi.json` (development only) |
+
+- Endpoints depend on permissions, not role names (`app/auth/permissions.py`).
+- Unknown roles in a token are ignored. A token with no known role is
+  authenticated but has no permissions (403 everywhere except `/me`).
+- All roles are tenant-scoped. There is **no cross-tenant role** in the API.
+  Platform operations (tenant provisioning, integration settings) happen via
+  the CLI and database, not the API.
+- Tenant admins can publish mapping versions (they can't execute code or
+  target destination-owned fields; see ED-007). They **cannot** change
+  connection URLs (SSRF) or secret references (credential theft); those are
+  operator-managed.
+
+## Tenant isolation
+
+| Layer | Control | Evidence |
 |---|---|---|
-| OAuth 2.0 client credentials to the CRM; token cached, refreshed on 401 | `crm_client.py` | `test_crm_client.py`, `test_crm_contract.py` |
-| CRM tokens expire server-side (mock enforces TTL, expired tokens purged) | `mock_crm/main.py` | `test_mock_rejects_expired_token`, `test_expired_tokens_are_purged` |
-| Constant-time credential comparison in mocks | `mock_crm`, `mock_internal` | — |
-| Production refuses dev-default secrets and non-HTTPS upstreams | `app/core/config.py` | `test_production_safety.py` |
-| Mock `/_admin` routes never mounted in production; forcing them raises | `mock_common/guard.py` | `test_production_safety.py` |
-| Mapping configs cannot execute code (whitelisted transforms, strict schema, no eval) | `app/mapping/` | `test_invalid_mapping_configs_are_rejected` |
-| Tenant id validated before file access (path traversal) | `MappingRegistry` | `test_registry_rejects_path_traversal_and_missing_tenants` |
-| Destination-owned fields cannot be written by sync | `account_sync.py`, `internal_customer.py` | `test_destination_owned_fields_preserved_across_sync` |
-| Account payloads and tokens excluded from logs, errors and sync history | clients, mapper, sync service | `test_account_payload_not_logged`, `test_mapping_errors_never_echo_source_values`, `test_sync_logs_and_history_exclude_account_data` |
-| Path parameters URL-encoded in outbound calls | both clients | `test_account_id_is_url_encoded` |
-| Sync history reads require a tenant id | `sync_history.py` | `test_history_is_tenant_scoped` |
-| Tenant is never taken from caller input | `api/deps.py` | `test_tenant_cannot_be_chosen_by_caller` |
-| PostgreSQL published on 127.0.0.1 only. No credentials in the repo (compose requires `POSTGRES_PASSWORD` from gitignored `.env`) | `docker-compose.yml` | manual: LAN IP port 5434 closed |
-| No account payload columns in the database | `app/db/models.py` | `test_no_account_payload_columns`, live check: 0 rows contain account names |
-| SQL parameters never logged (`hide_parameters=True`) | `app/db/engine.py` | — |
-| DB constraints enforce tenant id format and failure/success consistency | migration `0001` | `test_check_constraints_reject_invalid_rows` |
-| Destructive downgrade requires explicit opt-in | migration `0001` | `test_destructive_downgrade_refused_without_explicit_opt_in` |
-| Integration tests can't touch non-test databases | `tests/integration/conftest.py` | name must end in `_test` (verified to abort) |
-| App container runs as a non-root user | `Dockerfile` | — |
+| Identity | tenant from verified token only. Tenant must exist and be active | `test_api_security.py` |
+| HTTP | no endpoint accepts a tenant id. Another tenant's record id → 404 (not 403, so no existence oracle) | `test_history_is_isolated_between_tenants` |
+| Repositories | every method takes `tenant_id` first. No "list all tenants' data" method exists | `test_pg_tenants.py`, `test_pg_history.py` |
+| Database | FK `tenant_id → tenants`. Mapping rows CHECK `config->>'tenant_id' = tenant_id` | `test_tenant_constraints` |
+| Connections | a separate CRM/CMS client per tenant, built from that tenant's row and secrets. **OAuth tokens are never shared between tenants** | `test_crm_tokens_are_never_shared_between_tenants` |
+| Secrets | DB stores references only (`env:IL_<TENANT>__<NAME>`). The resolver parses the reference and requires an exact tenant-segment match | `test_resolver_prefix_collision_between_tenant_ids_is_impossible` |
+| Mappings | stored and versioned per tenant. A stored config naming another tenant is refused | `test_stored_mapping_for_wrong_tenant_is_rejected` |
+| Concurrency | the advisory-lock key includes tenant id | `test_scope_is_tenant_and_account` |
 
-## Known gaps (do not deploy)
+**Bug found and fixed during M5:** the first secret-namespace check was a
+prefix match on `IL_<TENANT>_`, which would have let tenant `a` resolve
+`IL_A_B_KEY` belonging to tenant `a-b`. It was replaced by parsing with a
+`__` delimiter and a strict name grammar. The regression tests fail against
+the old logic (verified).
 
-- **IntegrationLab's API is unauthenticated.** `/sync/*` can be called by
-  anyone who can reach the port. OIDC + RBAC arrive in M5.
-- **Single tenant.** `get_current_tenant()` returns `DEFAULT_TENANT_ID`.
-- **Secrets come from env vars.** There's no secret manager integration yet.
-- **Internal CMS auth is a static API key.** It's realistic for many internal
-  systems, but there's no rotation story.
-- **Database connection is unencrypted** (local Docker network). Production
-  would need `sslmode=verify-full` and a least-privilege DB role. The app
-  currently uses the database owner role for both migrations and runtime.
-- **Sync history is not tamper-evident** and has no retention policy yet.
-- **Mocks are not hardened.** No rate limiting, and in-memory idempotency
-  and token stores grow until restart (tokens are purged on issue).
+## Other implemented controls
+
+| Control | Where | Evidence |
+|---|---|---|
+| OAuth 2.0 client credentials to each tenant's CRM, with a per-tenant token cache | `crm_client.py`, `tenant_context.py` | `test_crm_contract.py`, `test_tenant_isolation.py` |
+| Production refuses: dev-default secrets, `dev-only*` tenant secrets, non-HTTPS upstreams, non-HTTPS OIDC issuer/JWKS, the mock IdP issuer, a missing `DATABASE_URL` | `config.py`, `secrets.py` | `test_production_safety.py` |
+| OpenAPI and interactive docs not served in production | `app/main.py` | `test_docs_disabled_in_production` |
+| Mock `/_admin` routes never mounted in production/staging; forcing them raises | `mock_common/guard.py` | HTTP-probe tests in `test_production_safety.py` |
+| Mock IdP refuses to start in production/staging | `mock_idp/main.py` | `test_mock_idp_refuses_to_start_in_production_like_envs` |
+| Mapping configs cannot execute code | `app/mapping/` | `test_invalid_mapping_configs_are_rejected` |
+| Destination-owned fields cannot be written by sync | `account_sync.py` | `test_destination_owned_fields_preserved_across_sync` |
+| Account payloads and tokens excluded from logs, errors and history | clients, mapper, service, auth | multiple tests |
+| No account payload columns in the database. SQL parameters never logged | `models.py`, `engine.py` | `test_no_account_payload_columns` |
+| PostgreSQL and all services on 127.0.0.1 only. No credentials in the repo | `docker-compose.yml` | manual LAN check |
+| Destructive downgrades need `ALLOW_DESTRUCTIVE_DOWNGRADE=1` | migrations | `test_destructive_downgrade_refused_without_explicit_opt_in` |
+| Containers run as a non-root user | `Dockerfile` | — |
+
+## Remaining risks (do not deploy)
+
+1. **Mock IdP only.** No authorization code + PKCE flow for browser login yet
+   (the M8 dashboard needs it). The `password` grant is a dev convenience and
+   is deprecated in OAuth 2.1.
+2. **No token revocation.** A stolen access token is valid until `exp`
+   (15 min from the mock IdP, ≤ 1 h by policy). Mitigations: short lifetimes;
+   suspending the tenant blocks all of its tokens immediately.
+3. **Roles are trusted from the IdP.** A misconfigured IdP mapping (e.g.
+   everyone gets `admin`) is not detectable by the API.
+4. **Tenant-id prefix hygiene.** Tenant ids containing `--` or a trailing `-`
+   can't resolve secrets (they fail closed). Provisioning should forbid them.
+5. **Secrets in environment variables.** No secret manager, rotation workflow
+   or audit of secret access. The resolver interface allows a vault backend.
+6. **No row-level security.** Isolation is enforced in the application and
+   repository layer. PostgreSQL RLS with a separate non-owner runtime role would
+   add defence in depth. The app currently connects as the database owner for
+   both migrations and runtime.
+7. **Unencrypted DB connection** (local Docker network). Production needs
+   `sslmode=verify-full`.
+8. **No rate limiting** on authentication failures or sync triggering.
+9. **No audit log** of administrative actions beyond `created_by` on mapping versions.
+10. **Mapping-publish authority.** Tenant admins can change how CRM data maps
+    to CRM-owned fields, which is within their tenant and audited by
+    `created_by`, but there's no approval workflow.
+11. **Lost-lock edge case** (M4): see "Concurrency lock: lost-lock mitigation"
+    in [architecture.md](architecture.md). Documented, not yet implemented.
+12. **Webhook endpoint is unauthenticated until the HMAC check**, so it does a
+    tenant lookup and a secret resolution per request. There's no rate limiting:
+    an attacker can force cheap DB reads (no writes happen without a valid signature).
+13. **Shared-secret HMAC.** Anyone holding a tenant's webhook secret can submit
+    events for that tenant. Events only trigger a re-fetch from the tenant's own
+    CRM (payload fields aren't applied), which limits the impact to extra syncs.
+14. **Replay window relies on clock sync** between CRM and API (NTP). Skew
+    beyond the tolerance causes rejections (fail closed).
+15. **No retention policy** for `webhook_events` yet (M7+).

@@ -186,3 +186,84 @@ def test_different_accounts_run_in_parallel_across_processes(pg_url, pg_engine, 
     intervals = sorted((r["acquired"], r["released"]) for r in results)
     # All four held their (different) locks at the same time.
     assert max(s for s, _ in intervals) < min(e for _, e in intervals)
+
+
+# --- Milestone 6: session-level lock, no open transaction ------------------- #
+def _lock_sessions(engine, app_name="integrationlab-test"):
+    with engine.connect() as c:
+        return c.execute(text(
+            "SELECT a.state, l.granted FROM pg_locks l JOIN pg_stat_activity a USING (pid) "
+            "WHERE l.locktype = 'advisory' AND a.application_name = :n"), {"n": app_name}).all()
+
+
+def test_no_transaction_open_while_lock_held(pg_engine, pg_url):
+    probe = build_engine(db_settings(pg_url), application_name="probe")
+    try:
+        with locks(pg_engine).hold(T, "SF-1"):
+            sessions = _lock_sessions(probe)
+        assert sessions == [("idle", True)]  # held, but not "idle in transaction"
+    finally:
+        probe.dispose()
+
+
+def test_idle_session_backstop_set_while_held_and_reset_after(pg_engine):
+    provider = PostgresAdvisorySyncLocks(pg_engine, lock_timeout_seconds=5, max_hold_seconds=123)
+    with provider.hold(T, "SF-1"):
+        pass
+    # The pooled connection comes back with settings reset and no lock.
+    with pg_engine.connect() as c:
+        assert c.exec_driver_sql("SHOW idle_session_timeout").scalar() == "0"
+        assert c.exec_driver_sql("SHOW lock_timeout").scalar() == "0"
+        assert c.execute(text("SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+                              "AND pid = pg_backend_pid()")).scalar() == 0
+
+
+def test_idle_session_backstop_releases_lock_of_hung_holder(pg_engine, pg_url):
+    """A holder that hangs past max_hold has its session ended by the server, freeing the lock."""
+    provider = PostgresAdvisorySyncLocks(pg_engine, lock_timeout_seconds=5, max_hold_seconds=1)
+    with provider.hold(T, "SF-1"):
+        assert try_lock_elsewhere(pg_url, T, "SF-1") is False
+        time.sleep(2.0)  # "hung" sync: lock session idle beyond idle_session_timeout
+        assert try_lock_elsewhere(pg_url, T, "SF-1") is True  # server reclaimed it
+    # Release found a dead session: no exception, connection invalidated, pool still healthy.
+    with pg_engine.connect() as c:
+        assert c.execute(text("SELECT 1")).scalar() == 1
+
+
+def test_failed_unlock_invalidates_connection_instead_of_pooling_it(pg_engine, pg_url):
+    """If the lock connection dies mid-sync, release can't run; the connection must not be reused."""
+    admin = build_engine(db_settings(pg_url), application_name="admin")
+    try:
+        with locks(pg_engine).hold(T, "SF-1"):
+            with admin.begin() as c:
+                c.execute(text("SELECT pg_terminate_backend(l.pid) FROM pg_locks l JOIN pg_stat_activity a "
+                               "USING (pid) WHERE l.locktype='advisory' "
+                               "AND a.application_name='integrationlab-test'"))
+        # No exception leaked to the caller; the lock is free; the pool hands out healthy connections.
+        assert try_lock_elsewhere(pg_url, T, "SF-1") is True
+        with pg_engine.connect() as c:
+            assert c.execute(text("SELECT 1")).scalar() == 1
+    finally:
+        admin.dispose()
+
+
+def test_lock_timeout_leaves_connection_clean(pg_engine):
+    holder_in, release = threading.Event(), threading.Event()
+
+    def holder():
+        with locks(pg_engine).hold(T, "SF-1"):
+            holder_in.set()
+            release.wait(10)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    holder_in.wait(5)
+    try:
+        with pytest.raises(LockTimeoutError):
+            with locks(pg_engine, timeout=0.2).hold(T, "SF-1"):
+                pass
+    finally:
+        release.set()
+        t.join()
+    with pg_engine.connect() as c:
+        assert c.exec_driver_sql("SHOW lock_timeout").scalar() == "0"

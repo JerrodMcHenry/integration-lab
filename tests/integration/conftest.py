@@ -3,7 +3,7 @@
 Safety rules:
 - Only TEST_DATABASE_URL is used, never DATABASE_URL.
 - The database name must end in ``_test``; otherwise the run aborts, because
-  these fixtures TRUNCATE ``sync_records`` between tests.
+  these fixtures TRUNCATE ``sync_records``, ``webhook_events`` and the tenant tables between tests.
 - The test database is created if missing (CREATE DATABASE is additive).
 - Migrations run forward (``upgrade head``) only.
 
@@ -81,6 +81,10 @@ def alembic_cfg(pg_url) -> Config:
     return cfg
 
 
+#: Tenant rows present before every integration test (sync_records has a FK to tenants).
+TEST_TENANTS = ("meridian", "harbor", "other", "other-tenant")
+
+
 def db_settings(url: str, **overrides) -> DatabaseSettings:
     values = dict(url=url, pool_size=5, max_overflow=5, pool_timeout_seconds=5.0,
                   connect_timeout_seconds=2, lock_timeout_seconds=5.0)
@@ -92,7 +96,11 @@ def db_settings(url: str, **overrides) -> DatabaseSettings:
 def pg_engine(pg_url):
     engine = build_engine(db_settings(pg_url), application_name="integrationlab-test")
     with engine.begin() as conn:
-        conn.execute(text("TRUNCATE sync_records RESTART IDENTITY"))
+        # Guarded by the '_test' name check in pg_url.
+        conn.execute(text("TRUNCATE webhook_events, sync_records, tenant_mapping_configs, tenant_integrations, "
+                          "tenants RESTART IDENTITY"))
+        conn.execute(text("INSERT INTO tenants (id, display_name) VALUES " + ", ".join(
+            f"('{t}', '{t}')" for t in TEST_TENANTS)))
     yield engine
     engine.dispose()
 

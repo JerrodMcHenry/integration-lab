@@ -13,6 +13,8 @@ COPY app ./app
 COPY mock_crm ./mock_crm
 COPY mock_internal ./mock_internal
 COPY mock_common ./mock_common
+COPY mock_idp ./mock_idp
+COPY seed ./seed
 
 USER app
 EXPOSE 8000

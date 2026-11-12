@@ -7,21 +7,29 @@ Two implementations share the ``SyncLockProvider`` contract:
 * ``PostgresAdvisorySyncLocks``: PostgreSQL transaction-scoped advisory
   locks. Covers every process and host that uses the same database.
 
-Lock lifecycle (PostgreSQL)
----------------------------
-1. Check out a dedicated pooled connection and ``BEGIN``.
-2. ``SET LOCAL lock_timeout`` caps how long we wait for another holder, and
-   ``SET LOCAL idle_in_transaction_session_timeout`` is a backstop that
-   lets the server reclaim the lock if this process hangs.
-3. ``SELECT pg_advisory_xact_lock(key)``: blocks until acquired or
-   ``lock_timeout`` fires (SQLSTATE 55P03 -> ``LockTimeoutError``).
-4. The caller runs the whole sync (CRM read, mapping, CMS writes, history
-   insert) while the transaction stays open. No rows are written on this
-   connection; it exists only to hold the lock.
-5. On exit: ``COMMIT`` on success, ``ROLLBACK`` on exception. Either way
-   PostgreSQL releases transaction-scoped advisory locks automatically, so
-   there's no unlock call that can be forgotten or fail halfway.
-6. If the process crashes or the connection drops, the server ends the
+Lock lifecycle (PostgreSQL), revised in Milestone 6
+---------------------------------------------------
+Session-level advisory lock on an AUTOCOMMIT connection, so **no transaction
+is open while the sync makes HTTP calls**. (M4 used a transaction-scoped lock,
+which left the lock connection "idle in transaction" for the whole sync.)
+
+1. Check out a pooled connection in AUTOCOMMIT mode (every statement commits
+   on its own; nothing stays open).
+2. ``SET lock_timeout`` caps how long we wait for another holder.
+3. ``SELECT pg_advisory_lock(key)``: blocks until acquired or ``lock_timeout``
+   fires (SQLSTATE 55P03 -> ``LockTimeoutError``).
+4. ``SET idle_session_timeout`` (PostgreSQL >= 14): server-side backstop. If
+   this session stays idle longer than the maximum legitimate sync duration
+   (a hung process), the server ends it, which releases the lock.
+5. The caller runs the whole sync (CRM read, mapping, CMS writes, history
+   insert in its *own* short transaction). The lock connection is idle, not
+   in a transaction.
+6. ``SELECT pg_advisory_unlock(key)``, then ``RESET`` both settings and return
+   the connection to the pool. **If unlock fails, returns false, or anything
+   about the session is in doubt, the connection is invalidated (closed)
+   instead of pooled.** Closing a session always releases its advisory locks,
+   so a pooled connection can never carry a stale lock.
+7. If the process crashes or the connection drops, the server ends the
    session and releases the lock.
 
 The key is the first 8 bytes of ``sha256(tenant_id NUL crm_account_id)``,
@@ -87,49 +95,56 @@ class PostgresAdvisorySyncLocks:
                  max_hold_seconds: float = 300.0) -> None:
         self._engine = engine
         self._lock_timeout_ms = int(lock_timeout_seconds * 1000)
+        #: Server-side idle_session_timeout backstop while the lock is held.
         self._idle_timeout_ms = int(max_hold_seconds * 1000)
 
     @contextmanager
     def hold(self, tenant_id: str, crm_account_id: str) -> Iterator[None]:
         key = advisory_lock_key(tenant_id, crm_account_id)
         try:
-            conn = self._engine.connect()
+            conn = self._engine.connect().execution_options(isolation_level="AUTOCOMMIT")
         except (SQLAlchemyError, PoolTimeout) as exc:
             raise LockUnavailableError(f"cannot reach lock database: {type(exc).__name__}") from exc
 
+        reusable = False
         try:
             # --- acquire (only these errors are translated into lock errors) ---
             try:
-                txn = conn.begin()
-                # SET LOCAL can't take bind parameters; values are ints we computed.
-                conn.execute(text(f"SET LOCAL lock_timeout = {self._lock_timeout_ms}"))
-                conn.execute(text(
-                    f"SET LOCAL idle_in_transaction_session_timeout = {self._idle_timeout_ms}"))
-                conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+                # SET can't take bind parameters; values are ints we computed.
+                conn.exec_driver_sql(f"SET lock_timeout = {self._lock_timeout_ms}")
+                conn.execute(text("SELECT pg_advisory_lock(:key)"), {"key": key})
+                conn.exec_driver_sql(f"SET idle_session_timeout = {self._idle_timeout_ms}")
             except DBAPIError as exc:
-                _quiet(conn.rollback)
                 if getattr(exc.orig, "sqlstate", None) == "55P03":  # lock_not_available
+                    reusable = _reset(conn)  # lock was not taken; session is clean
                     raise LockTimeoutError("another sync of this account is still running") from exc
                 raise LockUnavailableError(f"lock acquisition failed: {type(exc).__name__}") from exc
             except SQLAlchemyError as exc:
-                _quiet(conn.rollback)
                 raise LockUnavailableError(f"lock acquisition failed: {type(exc).__name__}") from exc
 
             # --- critical section: caller's exceptions propagate unchanged ---
             try:
                 yield
-            except BaseException:
-                _quiet(txn.rollback)  # releases the lock
-                raise
-            # --- release ---
-            try:
-                txn.commit()  # releases the lock
-            except SQLAlchemyError:
-                # The work already finished. If the connection died, the server
-                # released the lock together with the session, so nothing leaks.
-                _quiet(txn.rollback)
+            finally:
+                # --- release ---
+                try:
+                    released = conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key}).scalar()
+                    reusable = bool(released) and _reset(conn)
+                except SQLAlchemyError:
+                    reusable = False  # session state unknown -> close it (releases the lock)
         finally:
+            if not reusable:
+                _quiet(conn.invalidate)
             _quiet(conn.close)
+
+
+def _reset(conn) -> bool:
+    try:
+        conn.exec_driver_sql("RESET idle_session_timeout")
+        conn.exec_driver_sql("RESET lock_timeout")
+        return True
+    except SQLAlchemyError:
+        return False
 
 
 def _quiet(fn) -> None:

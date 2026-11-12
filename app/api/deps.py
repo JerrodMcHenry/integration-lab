@@ -4,21 +4,30 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
+from typing import Annotated
 
+from fastapi import Depends
 from sqlalchemy import Engine
 
+from app.auth.dependencies import get_principal
+from app.auth.tokens import Principal
 from app.core.config import CRMSettings, InternalSystemSettings, Settings, get_settings
 from app.db.engine import build_engine
-from app.integrations.crm_client import CRMClient
-from app.integrations.internal_client import InternalSystemClient
-from app.mapping.mapper import MappingRegistry
 from app.repositories.sync_history import (
     InMemorySyncHistoryRepository,
     PostgresSyncHistoryRepository,
     SyncHistoryRepository,
 )
+from app.repositories.tenants import (
+    InMemoryTenantRepository,
+    PostgresTenantRepository,
+    TenantRepository,
+    seed_memory,
+)
 from app.services.account_sync import AccountSyncService
 from app.services.locks import InProcessSyncLocks, PostgresAdvisorySyncLocks, SyncLockProvider
+from app.services.secrets import EnvSecretResolver
+from app.services.tenant_context import DbMappingProvider, TenantConnectionProvider
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +37,8 @@ def get_engine() -> Engine | None:
     settings = get_settings()
     if not settings.database.url:
         logger.warning(
-            "DATABASE_URL not set: using IN-MEMORY sync history and IN-PROCESS locks. "
-            "History is lost on restart and multiple workers are NOT serialised.")
+            "DATABASE_URL not set: using IN-MEMORY history/tenants (seeded from seed/dev_tenants.json) "
+            "and IN-PROCESS locks. Data is lost on restart and multiple workers are NOT serialised.")
         return None
     return build_engine(settings.database)
 
@@ -38,6 +47,19 @@ def get_engine() -> Engine | None:
 def get_sync_history() -> SyncHistoryRepository:
     engine = get_engine()
     return PostgresSyncHistoryRepository(engine) if engine else InMemorySyncHistoryRepository()
+
+
+@lru_cache
+def get_tenant_repository() -> TenantRepository:
+    engine = get_engine()
+    if engine:
+        return PostgresTenantRepository(engine)
+    from app.seed import load_seed
+
+    repo = InMemoryTenantRepository()
+    for item in load_seed():
+        seed_memory(repo, item.tenant, item.integration, item.mapping)
+    return repo
 
 
 def worst_case_sync_seconds(crm: CRMSettings, internal: InternalSystemSettings) -> float:
@@ -70,20 +92,17 @@ def build_lock_provider(settings: Settings, engine: Engine | None) -> SyncLockPr
 @lru_cache
 def get_sync_service() -> AccountSyncService:
     settings = get_settings()
+    tenants = get_tenant_repository()
     return AccountSyncService(
-        crm=CRMClient(settings.crm),
-        destination=InternalSystemClient(settings.internal),
-        mappings=MappingRegistry(settings.mapping_config_dir),
+        connections=TenantConnectionProvider(
+            tenants, EnvSecretResolver(app_env=settings.environment),
+            crm_defaults=settings.crm, cms_defaults=settings.internal),
+        mappings=DbMappingProvider(tenants),
         history=get_sync_history(),
         locks=build_lock_provider(settings, get_engine()),
     )
 
 
-def get_current_tenant() -> str:
-    """Resolve the caller's tenant.
-
-    TEMPORARY (until Milestone 5): returns the configured single tenant. It
-    deliberately does NOT read a tenant id from the path, query or headers. M5
-    replaces this with tenant resolution from a verified OIDC access token.
-    """
-    return get_settings().default_tenant_id
+def get_current_tenant(principal: Annotated[Principal, Depends(get_principal)]) -> str:
+    """The caller's tenant, taken only from the verified access token."""
+    return principal.tenant_id

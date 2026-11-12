@@ -183,18 +183,15 @@ def test_history_write_fails_after_successful_sync(pg_engine, dead_engine, crm_c
 # API with PostgreSQL
 # --------------------------------------------------------------------------- #
 @pytest.fixture
-def api_factory():
-    clients = []
-
+def api_factory(auth):
     def make(service, history):
         app.dependency_overrides[get_sync_service] = lambda: service
         app.dependency_overrides[get_sync_history] = lambda: history
-        tc = TestClient(app)
-        clients.append(tc)
-        return tc
+        return TestClient(app, headers=auth.headers("operator", "meridian"))
 
     yield make
-    app.dependency_overrides.clear()
+    app.dependency_overrides.pop(get_sync_service, None)
+    app.dependency_overrides.pop(get_sync_history, None)
 
 
 def test_api_history_survives_restart(pg_url, pg_engine, crm_client, cms_client, api_factory):

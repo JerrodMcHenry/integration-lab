@@ -15,14 +15,14 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import TypeAdapter, ValidationError
 
 from app.integrations.crm_client import CRMClient
 from app.integrations.errors import IntegrationError
 from app.integrations.internal_client import InternalConflictError, InternalSystemClient
-from app.mapping.mapper import MappingConfigError, MappingError, MappingRegistry
+from app.mapping.mapper import FieldMapper, MappingConfigError, MappingError
 from app.repositories.sync_history import SyncHistoryRepository
 from app.schemas.internal_customer import (
     CRM_OWNED_FIELDS,
@@ -31,6 +31,11 @@ from app.schemas.internal_customer import (
 )
 from app.schemas.sync import SyncErrorDetail, SyncRecord, SyncStage, SyncStatus
 from app.services.locks import InProcessSyncLocks, LockError, SyncLockProvider
+from app.services.tenant_context import ConnectionProvider, StaticConnections, TenantConnectionError
+
+
+class MappingProvider(Protocol):
+    def get(self, tenant_id: str) -> FieldMapper: ...
 
 logger = logging.getLogger(__name__)
 
@@ -66,14 +71,18 @@ class AccountSyncService:
     def __init__(
         self,
         *,
-        crm: CRMClient,
-        destination: InternalSystemClient,
-        mappings: MappingRegistry,
+        crm: CRMClient | None = None,
+        destination: InternalSystemClient | None = None,
+        mappings: MappingProvider,
         history: SyncHistoryRepository,
         locks: SyncLockProvider | None = None,
+        connections: ConnectionProvider | None = None,
     ) -> None:
-        self._crm = crm
-        self._destination = destination
+        if connections is None:
+            if crm is None or destination is None:
+                raise ValueError("provide either connections or both crm and destination")
+            connections = StaticConnections(crm, destination)
+        self._connections = connections
         self._mappings = mappings
         self._history = history
         self._locks: SyncLockProvider = locks or InProcessSyncLocks()
@@ -162,13 +171,20 @@ class AccountSyncService:
                 code="mapping_config_invalid", message=str(exc), retryable=False)) from exc
         ctx["mapping_version"] = mapper.version
 
-        # 2. Extract from the CRM.
+        # 2. Resolve this tenant's own clients (credentials never shared across tenants).
         try:
-            source = self._crm.get_account(crm_account_id)
+            clients = self._connections.for_tenant(tenant_id)
+        except TenantConnectionError as exc:
+            raise _SyncFailure(SyncStage.FETCH_SOURCE, SyncErrorDetail(
+                code=exc.code, message=str(exc), retryable=False)) from exc
+
+        # 3. Extract from the CRM.
+        try:
+            source = clients.crm.get_account(crm_account_id)
         except IntegrationError as exc:
             raise _SyncFailure(SyncStage.FETCH_SOURCE, _detail(exc)) from exc
 
-        # 3. Transform + validate.
+        # 4. Transform + validate.
         try:
             payload = mapper.map(source)
         except MappingError as exc:
@@ -178,27 +194,27 @@ class AccountSyncService:
         ctx["source_last_modified"] = payload.crm_last_modified_at
         desired = payload.model_dump(mode="python", exclude_unset=True)
 
-        # 4. Load into the destination.
+        # 5. Load into the destination.
         try:
-            return self._load(tenant_id, payload.external_crm_id, desired, ctx)
+            return self._load(clients.destination, tenant_id, payload.external_crm_id, desired, ctx)
         except IntegrationError as exc:
             raise _SyncFailure(SyncStage.LOAD_DESTINATION, _detail(exc)) from exc
 
-    def _load(self, tenant_id: str, external_id: str, desired: dict[str, Any],
-              ctx: dict[str, Any]) -> tuple[SyncStatus, dict]:
+    def _load(self, destination: InternalSystemClient, tenant_id: str, external_id: str,
+              desired: dict[str, Any], ctx: dict[str, Any]) -> tuple[SyncStatus, dict]:
         _assert_crm_owned_only(desired)
-        existing = self._destination.get_customer_by_external_id(external_id)
+        existing = destination.get_customer_by_external_id(external_id)
 
         if existing is None:
             body = _to_json(desired)
             try:
-                created = self._destination.create_customer(
+                created = destination.create_customer(
                     body, idempotency_key=_idempotency_key(tenant_id, body))
                 return SyncStatus.CREATED, {"customer_id": created["customer_id"],
                                             "fields_changed": sorted(desired)}
             except InternalConflictError:
                 # Another writer created it between our read and our create. Fall through to update.
-                existing = self._destination.get_customer_by_external_id(external_id)
+                existing = destination.get_customer_by_external_id(external_id)
                 if existing is None:
                     raise
 
@@ -212,7 +228,7 @@ class AccountSyncService:
             return SyncStatus.UNCHANGED, {}
 
         _assert_crm_owned_only(changes)
-        self._destination.update_customer(existing["customer_id"], _to_json(changes))
+        destination.update_customer(existing["customer_id"], _to_json(changes))
         return SyncStatus.UPDATED, {"fields_changed": sorted(changes)}
 
 
