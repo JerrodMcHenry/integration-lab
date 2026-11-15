@@ -23,7 +23,7 @@ in the same statement as the state change (retry history).
   worker's update matches zero rows and is discarded.
 * **Crash recovery:** a ``processing`` row whose lease has expired is claimable
   again. ``attempts`` counts claims. Once it reaches ``max_attempts``, the row
-  is marked ``failed`` (``worker_attempts_exhausted``) instead of being
+  is moved to ``dead_letter`` (``worker_attempts_exhausted``) instead of being
   reclaimed forever.
 
 """

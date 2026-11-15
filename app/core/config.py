@@ -172,7 +172,7 @@ class WorkerSettings:
     #: How long a claimed event is reserved. None = derived from the worst-case sync duration.
     lease_seconds: float | None = None
     #: Max claims per event. Bounds crash loops: an event whose processing keeps
-    #: killing workers is marked failed instead of being reclaimed forever.
+    #: killing workers is moved to dead_letter instead of being reclaimed forever.
     max_attempts: int = 5
 
     def __post_init__(self) -> None:

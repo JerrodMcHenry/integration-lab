@@ -59,13 +59,8 @@ The dashboard refreshes every five seconds and displays the latest 100 events.
 
 ### Dashboard Preview
 
-_Add a screenshot of the running dashboard here._
-
-Recommended location: `docs/images/integration-dashboard.png`
-
-```md
+<!-- Screenshot of the running dashboard (real capture, PNG): docs/images/integration-dashboard.png -->
 ![IntegrationLab integration operations dashboard](docs/images/integration-dashboard.png)
-```
 
 ### Demonstration: Recovering a Failed Integration
 
@@ -195,7 +190,7 @@ Recovery actions include:
 - Error classification and retryability.
 - Retry scheduling.
 - Dead-letter handling.
-- Manual replay with a required reason.
+- Manual replay with an optional reason, recorded in the audit log.
 - Audit records for replay actions and authorization denials.
 
 **Design rationale:** Enterprise integrations need a recovery process that is observable and controlled, rather than relying on silent retries or manual database intervention.
@@ -336,11 +331,9 @@ The mock CRM, CMS, and identity provider are implemented as local FastAPI servic
 ### 1. Clone the Repository
 
 ```bash
-git clone <repository-url>
-cd <repository-directory>
+git clone https://github.com/JerrodMcHenry/integration-lab.git
+cd integration-lab
 ```
-
-Replace the placeholders with the repository's actual URL and directory name.
 
 ### 2. Configure the Environment
 
@@ -402,7 +395,21 @@ This stops the containers without deleting the PostgreSQL volume.
 
 ## Running Tests
 
+Running the tests outside Docker additionally requires:
+
+- **Python 3.14** (the API image uses `python:3.14-slim`)
+- **Node.js 26** with npm (the dashboard image builds with `node:26-alpine`)
+- A `.env` created from `.env.example` with `POSTGRES_PASSWORD` set (see Getting Started)
+
 ### Backend
+
+Create a virtual environment and install dependencies:
+
+```bash
+python3.14 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
 Start PostgreSQL:
 

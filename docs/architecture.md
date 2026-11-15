@@ -370,7 +370,7 @@ partial `(lease_expires_at) WHERE status='processing'` (crash recovery),
 | Two workers never take the same event | `FOR UPDATE SKIP LOCKED` in the claim | 4 OS processes × 30 events: every event `attempts = 1`. 8 threads × 40 claims: disjoint. Removing SKIP LOCKED makes both tests fail |
 | No transaction during HTTP | claim and complete are separate short transactions. Lock connection is idle, not in a transaction | `pg_stat_activity` probed at every outbound HTTP request: 0 idle-in-transaction. Reverting the lock makes it fail |
 | Worker crash | lease expires → reclaimed by any worker (`attempts + 1`) | real `SIGKILL` mid-event, then recovery by another worker |
-| Crash loops | at `attempts ≥ WORKER_MAX_ATTEMPTS` an expired event becomes `failed / worker_attempts_exhausted` | tested |
+| Crash loops | at `attempts ≥ WORKER_MAX_ATTEMPTS` an expired event becomes `dead_letter / worker_attempts_exhausted` | tested |
 | Stale worker after lease loss | completion requires the matching `claim_token` | stale completion while the new owner holds the lease is rejected (mutation-tested) |
 | DB down at claim | worker logs, backs off (≤ 30 s), keeps running | tested |
 | DB down at completion | event stays `processing`, is reclaimed after the lease, and re-runs idempotently (`unchanged`) | tested |
